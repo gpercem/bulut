@@ -20,6 +20,19 @@ export default defineConfig({
       },
     },
     preact(),
+    // Prepend 'use client' directive to the React wrapper entry (index)
+    // so Next.js App Router can import it directly without a wrapper.
+    // Runs after Terser so the directive is never stripped.
+    {
+      name: 'use-client-directive',
+      generateBundle(_options, bundle) {
+        for (const chunk of Object.values(bundle)) {
+          if (chunk.type === 'chunk' && chunk.name === 'index') {
+            chunk.code = `'use client';\n${chunk.code}`;
+          }
+        }
+      },
+    },
   ],
   build: {
     lib: {

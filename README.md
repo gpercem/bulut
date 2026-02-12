@@ -31,7 +31,6 @@ function App() {
       <h1>My App</h1>
       <Bulut
         projectId="your-project-id"
-        backendBaseUrl="https://api.example.com"
       />
     </>
   );
@@ -55,7 +54,6 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
         {children}
         <Bulut
           projectId="your-project-id"
-          backendBaseUrl="https://api.example.com"
         />
       </body>
     </html>
@@ -75,7 +73,6 @@ export function ChatWidget() {
   return (
     <Bulut
       projectId="your-project-id"
-      backendBaseUrl="https://api.example.com"
       baseColor="#0ea5e9"
       voice="ali"
     />
@@ -96,7 +93,6 @@ export default function App({ Component, pageProps }: AppProps) {
       <Component {...pageProps} />
       <Bulut
         projectId="your-project-id"
-        backendBaseUrl="https://api.example.com"
       />
     </>
   );
@@ -112,7 +108,6 @@ For non-React sites, use the `bulut/embed` entry point:
   import Bulut from 'https://unpkg.com/bulut/dist/embed.js';
   Bulut.init({
     projectId: 'your-project-id',
-    backendBaseUrl: 'https://api.example.com',
   });
 </script>
 ```
@@ -140,7 +135,6 @@ Initialize the widget. Accepts the same props as the React component, plus:
 ```js
 Bulut.init({
   projectId: 'your-project-id',
-  backendBaseUrl: 'https://api.example.com',
   baseColor: '#0ea5e9',
 });
 ```

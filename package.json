@@ -1,5 +1,5 @@
 {
-  "name": "bulutbot",
+  "name": "@auticlabs/bulut",
   "version": "1.0.0",
   "description": "Bulut – a lightweight AI chatbot widget for React, Next.js and Vite applications",
   "type": "module",

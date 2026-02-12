@@ -36,7 +36,7 @@ export interface BulutRuntimeConfig {
 const DEFAULT_LLM_MODEL = "google/gemini-3-flash-preview:nitro";
 
 const DEFAULT_CONFIG: BulutRuntimeConfig = {
-  backendBaseUrl: "api.bulut.lu",
+  backendBaseUrl: "https://api.bulut.lu",
   projectId: "", // Must be provided
   model: DEFAULT_LLM_MODEL,
   voice: "zeynep",
