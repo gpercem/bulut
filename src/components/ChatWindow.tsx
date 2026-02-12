@@ -1070,7 +1070,7 @@ export const ChatWindow = ({
     padding: isUser ? "9px 14px" : "9px 0px",
     borderRadius: BORDER_RADIUS.message,
     fontSize: "14px",
-    lineHeight: "1.3",
+    lineHeight: "140%",
     wordWrap: "break-word",
     whiteSpace: "pre-wrap",
     alignSelf: isUser ? "flex-end" : "flex-start",

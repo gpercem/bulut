@@ -417,6 +417,7 @@ const ensureCursor = (): HTMLElement => {
   cursor.style.background = baseColor;
   const border = 25 * 16 / 100;
   cursor.style.border = `${border}px solid #ffffff`;
+  cursor.style.boxShadow = "0px 0px 10px rgba(0, 11, 26, 0.5)";
   cursor.style.boxSizing = "border-box";
   cursor.style.zIndex = "2147483647";
   cursor.style.pointerEvents = "none";
