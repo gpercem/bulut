@@ -4,18 +4,18 @@ A lightweight, embeddable AI chatbot widget for React, Next.js, and Vite applica
 
 ## Features
 
-- 🎤 Voice input with real-time STT → LLM → TTS pipeline
-- 💬 Floating chat window with streaming responses
-- 🔧 Built-in tool calling (page navigation, element interaction)
-- 🎨 Themeable via a single hex colour prop
-- 📦 Zero-CSS — everything is scoped inside Shadow DOM
-- ♿ Accessibility mode for hands-free usage
-- ⚡ Tiny footprint — ships as a single JS bundle
+- Voice input with real-time STT → LLM → TTS pipeline
+- Floating chat window with streaming responses
+- Built-in tool calling (page navigation, element interaction)
+- Themeable via a single hex colour prop
+- Zero-CSS — everything is scoped inside Shadow DOM
+- Accessibility mode for hands-free usage
+- Tiny footprint — ships as a single JS bundle
 
 ## Installation
 
 ```bash
-npm install bulut
+npm install bulutbot
 ```
 
 ## Quick Start
@@ -23,7 +23,7 @@ npm install bulut
 ### React / Vite
 
 ```tsx
-import { Bulut } from 'bulut';
+import { Bulut } from 'bulutbot';
 
 function App() {
   return (
