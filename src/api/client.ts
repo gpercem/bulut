@@ -1,0 +1,1392 @@
+export type ChatRole = "system" | "user" | "assistant";
+
+export interface ChatMessage {
+  role: ChatRole;
+  content: string;
+}
+
+interface ApiErrorBody {
+  detail?: string;
+  error?: string;
+  message?: string;
+}
+
+interface SseEventPayload {
+  type?: string;
+  session_id?: string;
+  user_text?: string;
+  assistant_text?: string;
+  delta?: string;
+  audio?: string;
+  format?: string;
+  mime_type?: string;
+  sample_rate?: number;
+  error?: string;
+}
+
+interface TtsWsEventPayload {
+  type?: string;
+  request_id?: string;
+  seq?: number;
+  audio?: string;
+  format?: string;
+  mime_type?: string;
+  sample_rate?: number;
+  error?: string;
+  retryable?: boolean;
+  last_seq?: number;
+}
+
+export type AudioStreamState = "rendering" | "playing" | "done" | "fallback";
+export const TTS_WS_RETRY_DELAYS_MS = [250, 750, 1500];
+const FORCED_TTS_VOICE = "zeynep";
+
+const normalizeBaseUrl = (baseUrl: string) => baseUrl.replace(/\/+$/, "");
+const toWebSocketUrl = (baseUrl: string, path: string): string => {
+  const normalized = normalizeBaseUrl(baseUrl);
+  const url = new URL(normalized);
+  url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
+  url.pathname = `${url.pathname.replace(/\/$/, "")}${path}`;
+  url.search = "";
+  url.hash = "";
+  return url.toString();
+};
+
+const createRequestId = (): string => {
+  if (typeof crypto !== "undefined" && "randomUUID" in crypto) {
+    return crypto.randomUUID();
+  }
+  return `tts-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+};
+
+export const parseTtsWsEventPayload = (
+  value: unknown,
+): TtsWsEventPayload | null => {
+  try {
+    if (typeof value !== "string") {
+      return null;
+    }
+    return JSON.parse(value) as TtsWsEventPayload;
+  } catch {
+    return null;
+  }
+};
+
+export const shouldAcceptAudioSeq = (
+  incomingSeq: number,
+  highestSeqSeen: number,
+): boolean => incomingSeq > highestSeqSeen;
+
+export const shouldFallbackToSse = (error: unknown): boolean => {
+  if (typeof error === "object" && error !== null && "retryable" in error) {
+    return Boolean((error as { retryable?: boolean }).retryable);
+  }
+  return true;
+};
+
+const parseErrorBody = async (response: Response): Promise<string> => {
+  try {
+    const data = (await response.json()) as ApiErrorBody;
+    const detail = data.detail;
+    if (typeof detail === "string") return detail;
+    if (detail && typeof detail === "object") return JSON.stringify(detail);
+    return data.error || data.message || response.statusText;
+  } catch {
+    return response.statusText;
+  }
+};
+
+const sleep = (ms: number): Promise<void> =>
+  new Promise((resolve) => {
+    setTimeout(resolve, ms);
+  });
+
+export const base64ToUint8Array = (base64: string): Uint8Array<ArrayBuffer> => {
+  // Strip potential data URI prefix if present
+  const cleanBase64 = base64.replace(/^data:audio\/\w+;base64,/, "");
+  const binaryString = atob(cleanBase64);
+  const bytes = new Uint8Array(binaryString.length) as Uint8Array<ArrayBuffer>;
+  for (let i = 0; i < binaryString.length; i += 1) {
+    bytes[i] = binaryString.charCodeAt(i);
+  }
+  return bytes;
+};
+
+const createWavHeader = (
+  length: number,
+  sampleRate: number = 16000,
+): Uint8Array<ArrayBuffer> => {
+  const buffer = new ArrayBuffer(44);
+  const view = new DataView(buffer);
+  const channels = 1;
+
+  // RIFF chunk descriptor
+  view.setUint32(0, 0x52494646, false); // "RIFF"
+  view.setUint32(4, 36 + length, true); // file length - 8
+  view.setUint32(8, 0x57415645, false); // "WAVE"
+
+  // fmt sub-chunk
+  view.setUint32(12, 0x666d7420, false); // "fmt "
+  view.setUint32(16, 16, true); // Subchunk1Size (16 for PCM)
+  view.setUint16(20, 1, true); // AudioFormat (1 for PCM)
+  view.setUint16(22, channels, true); // NumChannels
+  view.setUint32(24, sampleRate, true); // SampleRate
+  view.setUint32(28, sampleRate * channels * 2, true); // ByteRate
+  view.setUint16(32, channels * 2, true); // BlockAlign
+  view.setUint16(34, 16, true); // BitsPerSample
+
+  // data sub-chunk
+  view.setUint32(36, 0x64617461, false); // "data"
+  view.setUint32(40, length, true); // Subchunk2Size
+
+  return new Uint8Array(buffer) as Uint8Array<ArrayBuffer>;
+};
+const waitForPlaybackEnd = async (
+  audioElement: HTMLAudioElement,
+): Promise<void> => {
+  if (audioElement.ended) {
+    return;
+  }
+
+  await new Promise<void>((resolve, reject) => {
+    const watchdog = window.setInterval(() => {
+      if (!audioElement.ended) {
+        console.info("[Bulut] playback watchdog: still playing...");
+      }
+    }, 30000);
+
+    const onEnded = () => {
+      cleanup();
+      resolve();
+    };
+
+    const onError = () => {
+      cleanup();
+      reject(new Error("Ses oynatma hatası oluştu."));
+    };
+
+    const cleanup = () => {
+      window.clearInterval(watchdog);
+      audioElement.removeEventListener("ended", onEnded);
+      audioElement.removeEventListener("error", onError);
+    };
+
+    audioElement.addEventListener("ended", onEnded);
+    audioElement.addEventListener("error", onError);
+  });
+};
+
+
+
+const playBufferedAudio = async (
+  chunks: Uint8Array<ArrayBuffer>[],
+  mimeType: string,
+  sampleRate: number = 16000,
+  onAudioStateChange?: (state: AudioStreamState) => void,
+): Promise<void> => {
+  if (chunks.length === 0) {
+    onAudioStateChange?.("done");
+    return;
+  }
+
+  // Debug info
+  const totalBytes = chunks.reduce((acc, c) => acc + c.byteLength, 0);
+  console.log(`[Bulut] Playing buffered audio: ${chunks.length} chunks, ${totalBytes} bytes, type=${mimeType}`);
+
+  onAudioStateChange?.("fallback");
+
+  const blobParts: ArrayBuffer[] = chunks.map((chunk) => {
+    const copied = new Uint8Array(chunk.byteLength) as Uint8Array<ArrayBuffer>;
+    copied.set(chunk);
+    return copied.buffer;
+  });
+
+  // Verify magic numbers and detect MIME type
+  let detectedMime = mimeType;
+  if (chunks.length > 0 && chunks[0].length >= 4) {
+    const header = Array.from(chunks[0].slice(0, 4))
+      .map(b => b.toString(16).padStart(2, '0').toUpperCase())
+      .join(' ');
+    console.log(`[Bulut] Audio header (hex): ${header}`);
+
+    // Magic number detection
+    if (header.startsWith("49 44 33")) { // ID3
+      detectedMime = "audio/mpeg";
+    } else if (header.startsWith("FF F3") || header.startsWith("FF F2")) { // MP3 Sync
+      detectedMime = "audio/mpeg";
+    } else if (header.startsWith("52 49 46 46")) { // RIFF (WAV)
+      detectedMime = "audio/wav";
+    } else if (header.startsWith("1A 45 DF A3")) { // EBML (WebM)
+      detectedMime = "audio/webm";
+    }
+  }
+
+  // Ensure valid MIME type
+  // Ensure valid MIME type or wrap raw PCM
+  let safeMimeType = detectedMime && detectedMime.includes("/") ? detectedMime : "audio/mpeg";
+  let finalBlobParts: BlobPart[] = blobParts;
+
+  if (mimeType === "audio/pcm") {
+    // Wrap raw PCM in WAV container
+    const totalLength = chunks.reduce((acc, c) => acc + c.byteLength, 0);
+    const header = createWavHeader(totalLength, sampleRate);
+    finalBlobParts = [header.buffer, ...blobParts];
+    safeMimeType = "audio/wav";
+    console.log(`[Bulut] Wrapped raw PCM in WAV (rate=${sampleRate})`);
+  }
+
+  console.log(`[Bulut] Creating blob with type: ${safeMimeType} (original: ${mimeType})`);
+  const blob = new Blob(finalBlobParts, { type: safeMimeType });
+
+  const audioElement = new Audio();
+  const objectUrl = URL.createObjectURL(blob);
+
+  try {
+    audioElement.preload = "auto";
+    audioElement.autoplay = true;
+    // Some browsers need this
+    audioElement.setAttribute("playsinline", "true");
+    audioElement.src = objectUrl;
+
+    await audioElement.play();
+    onAudioStateChange?.("playing");
+    await waitForPlaybackEnd(audioElement);
+    onAudioStateChange?.("done");
+  } catch (err) {
+    console.error(`[Bulut] Playback failed: ${err}`, { mimeType: safeMimeType, size: blob.size });
+    onAudioStateChange?.("done"); // Signal done to unblock UI even on error
+    throw err;
+  } finally {
+    audioElement.pause();
+    audioElement.removeAttribute("src");
+    audioElement.load();
+    URL.revokeObjectURL(objectUrl);
+  }
+};
+
+export interface VoiceChatEvents {
+  onTranscription?: (data: {
+    session_id: string;
+    user_text: string;
+  }) => void;
+  onAssistantDelta?: (delta: string) => void;
+  onAssistantDone?: (assistantText: string) => void;
+  onAudioStateChange?: (state: AudioStreamState) => void;
+  onError?: (error: string) => void;
+  // Backward compatibility for old callers.
+  onMetadata?: (data: {
+    session_id: string;
+    user_text: string;
+    assistant_text: string;
+  }) => void;
+}
+
+export interface StreamController {
+  stop: () => void;
+  done: Promise<void>;
+}
+
+export const parseSseEventPayload = (eventBlock: string): SseEventPayload | null => {
+  const dataLines = eventBlock
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => line.startsWith("data:"))
+    .map((line) => line.slice(5).trimStart());
+
+  if (dataLines.length === 0) {
+    return null;
+  }
+
+  const dataStr = dataLines.join("\n");
+  if (dataStr === "[DONE]") {
+    return { type: "done" };
+  }
+
+  try {
+    return JSON.parse(dataStr) as SseEventPayload;
+  } catch (error) {
+    console.warn("Error parsing SSE chunk:", error);
+    return null;
+  }
+};
+
+export const isAudioSsePayload = (
+  payload: SseEventPayload,
+): payload is SseEventPayload & { audio: string } =>
+  typeof payload.audio === "string" &&
+  (payload.type === undefined || payload.type === "audio");
+
+// ── Separated Endpoint Helpers ──────────────────────────────────────
+
+export async function transcribeAudio(
+  baseUrl: string,
+  file: File,
+  projectId: string,
+  sessionId: string | null,
+  language: string
+): Promise<{ text: string; session_id: string }> {
+  const url = `${normalizeBaseUrl(baseUrl)}/chat/stt`;
+  const formData = new FormData();
+  formData.append("file", file);
+  formData.append("project_id", projectId);
+  if (sessionId) formData.append("session_id", sessionId);
+  formData.append("language", language);
+
+  const response = await fetch(url, { method: "POST", body: formData });
+  if (!response.ok) {
+    throw new Error(await parseErrorBody(response));
+  }
+  return response.json();
+}
+
+interface TtsCollectResult {
+  chunks: Uint8Array<ArrayBuffer>[];
+  mimeType: string;
+  sampleRate: number;
+}
+
+const buildError = (message: string, retryable: boolean = true): Error & { retryable: boolean } => {
+  const error = new Error(message) as Error & { retryable: boolean };
+  error.retryable = retryable;
+  return error;
+};
+
+const collectTtsViaSse = async (
+  baseUrl: string,
+  assistantText: string,
+  accessibilityMode: boolean,
+  isStopped: () => boolean,
+  setReader: (reader: ReadableStreamDefaultReader<Uint8Array> | undefined) => void,
+): Promise<TtsCollectResult> => {
+  const ttsFormData = new FormData();
+  ttsFormData.append("text", assistantText);
+  ttsFormData.append("voice", FORCED_TTS_VOICE);
+  ttsFormData.append("accessibility_mode", String(accessibilityMode));
+
+  const ttsResponse = await fetch(`${normalizeBaseUrl(baseUrl)}/chat/tts`, {
+    method: "POST",
+    body: ttsFormData,
+  });
+
+  if (!ttsResponse.ok) {
+    throw buildError(await parseErrorBody(ttsResponse), false);
+  }
+
+  const reader = ttsResponse.body?.getReader();
+  if (!reader) {
+    throw buildError("TTS response body is not readable", false);
+  }
+
+  setReader(reader);
+
+  const chunks: Uint8Array<ArrayBuffer>[] = [];
+  let mimeType = "audio/mpeg";
+  let sampleRate = 16000;
+  const decoder = new TextDecoder();
+  let buffer = "";
+
+  while (true) {
+    if (isStopped()) {
+      break;
+    }
+
+    const { done, value } = await reader.read();
+    if (done) {
+      break;
+    }
+
+    buffer += decoder.decode(value, { stream: true });
+    const blocks = buffer.split(/\r?\n\r?\n/);
+    buffer = blocks.pop() || "";
+
+    for (const block of blocks) {
+      const payload = parseSseEventPayload(block);
+      if (!payload) {
+        continue;
+      }
+
+      if (isAudioSsePayload(payload)) {
+        const format = payload.format || "mp3";
+        mimeType = payload.mime_type || (format === "webm" ? "audio/webm" : "audio/mpeg");
+        chunks.push(base64ToUint8Array(payload.audio));
+        if (payload.sample_rate) {
+          sampleRate = payload.sample_rate;
+        }
+      }
+    }
+  }
+
+  reader.releaseLock();
+  setReader(undefined);
+
+  return { chunks, mimeType, sampleRate };
+};
+
+const collectTtsViaWebSocket = async (
+  baseUrl: string,
+  assistantText: string,
+  accessibilityMode: boolean,
+  isStopped: () => boolean,
+  setSocket: (socket: WebSocket | null) => void,
+): Promise<TtsCollectResult> => {
+  const wsUrl = toWebSocketUrl(baseUrl, "/chat/tts/ws");
+  const requestId = createRequestId();
+  const chunks: Uint8Array<ArrayBuffer>[] = [];
+  let mimeType = "audio/mpeg";
+  let sampleRate = 16000;
+  let highestSeqSeen = 0;
+
+  const connectOnce = (): Promise<void> =>
+    new Promise((resolve, reject) => {
+      if (isStopped()) {
+        reject(buildError("stream_stopped", false));
+        return;
+      }
+
+      let done = false;
+      let finalError: (Error & { retryable?: boolean }) | null = null;
+      const socket = new WebSocket(wsUrl);
+      setSocket(socket);
+
+      const finalize = (
+        mode: "resolve" | "reject",
+        error?: Error & { retryable?: boolean },
+      ) => {
+        socket.onopen = null;
+        socket.onmessage = null;
+        socket.onerror = null;
+        socket.onclose = null;
+        setSocket(null);
+        if (mode === "resolve") {
+          resolve();
+          return;
+        }
+        reject(error || buildError("tts_ws_closed", true));
+      };
+
+      socket.onopen = () => {
+        console.info(
+          `[Bulut] TTS WS connected request_id=${requestId} resume_seq=${highestSeqSeen}`,
+        );
+        socket.send(
+          JSON.stringify({
+            type: "start",
+            request_id: requestId,
+            text: assistantText,
+            voice: FORCED_TTS_VOICE,
+            accessibility_mode: accessibilityMode,
+            last_seq: highestSeqSeen,
+          }),
+        );
+      };
+
+      socket.onmessage = (event) => {
+        const payload = parseTtsWsEventPayload(String(event.data));
+        if (!payload) {
+          console.warn("[Bulut] TTS WS invalid JSON payload");
+          return;
+        }
+
+        if (payload.type === "audio" && typeof payload.audio === "string") {
+          const seq = typeof payload.seq === "number" ? payload.seq : 0;
+          if (shouldAcceptAudioSeq(seq, highestSeqSeen)) {
+            chunks.push(base64ToUint8Array(payload.audio));
+            highestSeqSeen = seq;
+            if (payload.mime_type) {
+              mimeType = payload.mime_type;
+            }
+            if (typeof payload.sample_rate === "number") {
+              sampleRate = payload.sample_rate;
+            }
+          } else {
+            console.info(
+              `[Bulut] TTS WS duplicate chunk ignored request_id=${requestId} seq=${seq} seen=${highestSeqSeen}`,
+            );
+          }
+
+          if (socket.readyState === WebSocket.OPEN) {
+            socket.send(
+              JSON.stringify({
+                type: "ack",
+                request_id: requestId,
+                last_seq: highestSeqSeen,
+              }),
+            );
+          }
+          return;
+        }
+
+        if (payload.type === "done") {
+          const streamLastSeq =
+            typeof payload.last_seq === "number" ? payload.last_seq : highestSeqSeen;
+          if (streamLastSeq > highestSeqSeen) {
+            finalError = buildError("tts_ws_sequence_gap", true);
+            done = false;
+            socket.close();
+            return;
+          }
+          done = true;
+          socket.close();
+          return;
+        }
+
+        if (payload.type === "error") {
+          finalError = buildError(payload.error || "tts_ws_error", payload.retryable !== false);
+          done = false;
+          socket.close();
+        }
+      };
+
+      socket.onerror = () => {
+        if (!finalError) {
+          finalError = buildError("tts_ws_transport_error", true);
+        }
+      };
+
+      socket.onclose = () => {
+        if (isStopped()) {
+          finalize("reject", buildError("stream_stopped", false));
+          return;
+        }
+        if (done) {
+          finalize("resolve");
+          return;
+        }
+        finalize("reject", finalError || buildError("tts_ws_closed_before_done", true));
+      };
+    });
+
+  for (let attempt = 0; attempt <= TTS_WS_RETRY_DELAYS_MS.length; attempt += 1) {
+    if (attempt > 0) {
+      const delay = TTS_WS_RETRY_DELAYS_MS[attempt - 1];
+      console.warn(
+        `[Bulut] TTS WS retry attempt=${attempt} delay_ms=${delay} last_seq=${highestSeqSeen}`,
+      );
+      await sleep(delay);
+    }
+
+    try {
+      await connectOnce();
+      return { chunks, mimeType, sampleRate };
+    } catch (error) {
+      const retryable =
+        shouldFallbackToSse(error);
+      const message = error instanceof Error ? error.message : String(error);
+      console.warn(
+        `[Bulut] TTS WS attempt failed attempt=${attempt} retryable=${retryable} error=${message}`,
+      );
+      if (!retryable || attempt === TTS_WS_RETRY_DELAYS_MS.length) {
+        throw error;
+      }
+    }
+  }
+
+  throw buildError("tts_ws_exhausted", true);
+};
+
+// ── Orchestrator ────────────────────────────────────────────────────
+
+export const voiceChatStream = (
+  baseUrl: string,
+  audioFile: File,
+  projectId: string,
+  sessionId: string | null,
+  config: {
+    model: string;
+    voice: string;
+    pageContext?: string;
+    accessibilityMode?: boolean;
+  },
+  events: VoiceChatEvents,
+): StreamController => {
+  let isStopped = false;
+  let activeReader: ReadableStreamDefaultReader<Uint8Array> | undefined;
+  let activeSocket: WebSocket | null = null;
+
+  const donePromise = new Promise<void>(async (resolve, reject) => {
+    try {
+      // 1. STT
+      if (isStopped) return resolve();
+      const sttResult = await transcribeAudio(baseUrl, audioFile, projectId, sessionId, "tr");
+
+      const currentSessionId = sttResult.session_id;
+      const userText = sttResult.text;
+
+      events.onTranscription?.({
+        session_id: currentSessionId,
+        user_text: userText,
+      });
+
+      // 2. LLM
+      if (isStopped) return resolve();
+
+      const llmFormData = new FormData();
+      llmFormData.append("project_id", projectId);
+      llmFormData.append("session_id", currentSessionId);
+      llmFormData.append("user_text", userText);
+      llmFormData.append("model", config.model);
+      if (config.pageContext) llmFormData.append("page_context", config.pageContext);
+      llmFormData.append("accessibility_mode", String(Boolean(config.accessibilityMode)));
+
+      const llmResponse = await fetch(`${normalizeBaseUrl(baseUrl)}/chat/llm`, {
+        method: "POST",
+        body: llmFormData,
+      });
+
+      if (!llmResponse.ok) {
+        throw new Error(await parseErrorBody(llmResponse));
+      }
+
+      activeReader = llmResponse.body?.getReader();
+      if (!activeReader) throw new Error("LLM response body is not readable");
+
+      const decoder = new TextDecoder();
+      let buffer = "";
+      let assistantText = "";
+
+      while (true) {
+        if (isStopped) break;
+        const { done, value } = await activeReader.read();
+        if (done) break;
+
+        buffer += decoder.decode(value, { stream: true });
+        const chunks = buffer.split(/\r?\n\r?\n/);
+        buffer = chunks.pop() || "";
+
+        for (const chunk of chunks) {
+          const data = parseSseEventPayload(chunk);
+          if (!data) continue;
+
+          // Capture auto-created session_id from the LLM stream
+          if (data.type === "session" && data.session_id) {
+            events.onTranscription?.({
+              session_id: data.session_id,
+              user_text: sttResult.text,
+            });
+            continue;
+          }
+
+          if (data.type === "llm_delta" && typeof data.delta === "string") {
+            events.onAssistantDelta?.(data.delta);
+            continue;
+          }
+
+          if (data.type === "llm_done") {
+            assistantText = data.assistant_text || "";
+            events.onAssistantDone?.(assistantText);
+            continue;
+          }
+
+          if (data.type === "error") {
+            throw new Error(data.error || "LLM Error");
+          }
+        }
+      }
+
+      // Release LLM reader
+      if (activeReader) {
+        activeReader.releaseLock();
+        activeReader = undefined;
+      }
+
+      // 3. TTS
+      if (isStopped || !assistantText) {
+        // If no assistant text (error?), we can't speak
+        return resolve();
+      }
+      console.info(
+        `[Bulut] TTS start mode=voice requested_voice=${config.voice} forced_voice=${FORCED_TTS_VOICE} accessibility_mode=${Boolean(config.accessibilityMode)}`,
+      );
+
+      // Notify we are starting to render audio (or waiting for it)
+      events.onAudioStateChange?.("rendering");
+      let ttsResult: TtsCollectResult;
+      try {
+        ttsResult = await collectTtsViaWebSocket(
+          baseUrl,
+          assistantText,
+          Boolean(config.accessibilityMode),
+          () => isStopped,
+          (socket) => {
+            activeSocket = socket;
+          },
+        );
+      } catch (wsError) {
+        if (isStopped) {
+          return resolve();
+        }
+        console.warn(
+          `[Bulut] TTS WS failed, falling back to SSE: ${wsError instanceof Error ? wsError.message : String(wsError)}`,
+        );
+        ttsResult = await collectTtsViaSse(
+          baseUrl,
+          assistantText,
+          Boolean(config.accessibilityMode),
+          () => isStopped,
+          (reader) => {
+            activeReader = reader;
+          },
+        );
+      }
+
+      if (!isStopped && ttsResult.chunks.length > 0) {
+        await playBufferedAudio(
+          ttsResult.chunks,
+          ttsResult.mimeType,
+          ttsResult.sampleRate,
+          events.onAudioStateChange,
+        );
+      } else {
+        events.onAudioStateChange?.("done");
+      }
+
+      resolve();
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      events.onError?.(msg);
+      reject(err);
+    } finally {
+      activeReader?.cancel().catch(() => { });
+      if (activeSocket && activeSocket.readyState <= WebSocket.OPEN) {
+        activeSocket.close();
+      }
+      activeSocket = null;
+    }
+  });
+
+  return {
+    stop: () => {
+      isStopped = true;
+      if (activeReader) {
+        activeReader.cancel().catch(() => { });
+      }
+      if (activeSocket && activeSocket.readyState <= WebSocket.OPEN) {
+        activeSocket.close();
+      }
+    },
+    done: donePromise,
+  };
+};
+
+// ── Text-only orchestrator (browser STT path) ───────────────────────
+// Skips /chat/stt — accepts pre-transcribed text and goes straight to
+// LLM + TTS.  Session is auto-created on the backend when sessionId
+// is null.
+
+export const textChatStream = (
+  baseUrl: string,
+  userText: string,
+  projectId: string,
+  sessionId: string | null,
+  config: {
+    model: string;
+    voice: string;
+    pageContext?: string;
+    accessibilityMode?: boolean;
+  },
+  events: VoiceChatEvents,
+): StreamController => {
+  let isStopped = false;
+  let activeReader: ReadableStreamDefaultReader<Uint8Array> | undefined;
+  let activeSocket: WebSocket | null = null;
+
+  const donePromise = new Promise<void>(async (resolve, reject) => {
+    try {
+      // 1. LLM
+      if (isStopped) return resolve();
+
+      const llmFormData = new FormData();
+      llmFormData.append("project_id", projectId);
+      if (sessionId) llmFormData.append("session_id", sessionId);
+      llmFormData.append("user_text", userText);
+      llmFormData.append("model", config.model);
+      if (config.pageContext) llmFormData.append("page_context", config.pageContext);
+      llmFormData.append("accessibility_mode", String(Boolean(config.accessibilityMode)));
+
+      const llmResponse = await fetch(`${normalizeBaseUrl(baseUrl)}/chat/llm`, {
+        method: "POST",
+        body: llmFormData,
+      });
+
+      if (!llmResponse.ok) {
+        throw new Error(await parseErrorBody(llmResponse));
+      }
+
+      activeReader = llmResponse.body?.getReader();
+      if (!activeReader) throw new Error("LLM response body is not readable");
+
+      const decoder = new TextDecoder();
+      let buffer = "";
+      let assistantText = "";
+
+      while (true) {
+        if (isStopped) break;
+        const { done, value } = await activeReader.read();
+        if (done) break;
+
+        buffer += decoder.decode(value, { stream: true });
+        const chunks = buffer.split(/\r?\n\r?\n/);
+        buffer = chunks.pop() || "";
+
+        for (const chunk of chunks) {
+          const data = parseSseEventPayload(chunk);
+          if (!data) continue;
+
+          // Capture auto-created session_id
+          if (data.type === "session" && data.session_id) {
+            events.onTranscription?.({
+              session_id: data.session_id,
+              user_text: userText,
+            });
+            continue;
+          }
+
+          if (data.type === "llm_delta" && typeof data.delta === "string") {
+            events.onAssistantDelta?.(data.delta);
+            continue;
+          }
+
+          if (data.type === "llm_done") {
+            assistantText = data.assistant_text || "";
+            events.onAssistantDone?.(assistantText);
+            continue;
+          }
+
+          if (data.type === "error") {
+            throw new Error(data.error || "LLM Error");
+          }
+        }
+      }
+
+      if (activeReader) {
+        activeReader.releaseLock();
+        activeReader = undefined;
+      }
+
+      // 2. TTS
+      if (isStopped || !assistantText) {
+        return resolve();
+      }
+      console.info(
+        `[Bulut] TTS start mode=text requested_voice=${config.voice} forced_voice=${FORCED_TTS_VOICE} accessibility_mode=${Boolean(config.accessibilityMode)}`,
+      );
+
+      events.onAudioStateChange?.("rendering");
+      let ttsResult: TtsCollectResult;
+      try {
+        ttsResult = await collectTtsViaWebSocket(
+          baseUrl,
+          assistantText,
+          Boolean(config.accessibilityMode),
+          () => isStopped,
+          (socket) => {
+            activeSocket = socket;
+          },
+        );
+      } catch (wsError) {
+        if (isStopped) {
+          return resolve();
+        }
+        console.warn(
+          `[Bulut] TTS WS failed, falling back to SSE: ${wsError instanceof Error ? wsError.message : String(wsError)}`,
+        );
+        ttsResult = await collectTtsViaSse(
+          baseUrl,
+          assistantText,
+          Boolean(config.accessibilityMode),
+          () => isStopped,
+          (reader) => {
+            activeReader = reader;
+          },
+        );
+      }
+
+      if (!isStopped && ttsResult.chunks.length > 0) {
+        await playBufferedAudio(
+          ttsResult.chunks,
+          ttsResult.mimeType,
+          ttsResult.sampleRate,
+          events.onAudioStateChange,
+        );
+      } else {
+        events.onAudioStateChange?.("done");
+      }
+
+      resolve();
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      events.onError?.(msg);
+      reject(err);
+    } finally {
+      activeReader?.cancel().catch(() => { });
+      if (activeSocket && activeSocket.readyState <= WebSocket.OPEN) {
+        activeSocket.close();
+      }
+      activeSocket = null;
+    }
+  });
+
+  return {
+    stop: () => {
+      isStopped = true;
+      if (activeReader) {
+        activeReader.cancel().catch(() => { });
+      }
+      if (activeSocket && activeSocket.readyState <= WebSocket.OPEN) {
+        activeSocket.close();
+      }
+    },
+    done: donePromise,
+  };
+};
+
+// ── Agent-mode Types ────────────────────────────────────────────────
+
+export interface AgentToolCallInfo {
+  call_id: string;
+  tool: string;
+  args: Record<string, unknown>;
+}
+
+export interface AgentVoiceChatEvents extends VoiceChatEvents {
+  /** Called when the agent requests tool execution on the frontend. */
+  onToolCalls?: (calls: AgentToolCallInfo[]) => void;
+  /** Called after each tool has been executed with the result. */
+  onToolResult?: (callId: string, toolName: string, result: string) => void;
+  /** Called at the start of each agent iteration. */
+  onIteration?: (iteration: number, maxIterations: number) => void;
+  /** Called when the backend confirms / creates a session ID. */
+  onSessionId?: (sessionId: string) => void;
+}
+
+// ── Agent Voice Chat Stream (STT → Agent WS → TTS) ─────────────────
+
+export const agentVoiceChatStream = (
+  baseUrl: string,
+  audioFile: File,
+  projectId: string,
+  sessionId: string | null,
+  config: {
+    model: string;
+    voice: string;
+    pageContext?: string;
+    accessibilityMode?: boolean;
+  },
+  events: AgentVoiceChatEvents,
+  executeTool: (call: AgentToolCallInfo) => Promise<{ call_id: string; result: string }>,
+): StreamController => {
+  let isStopped = false;
+  let activeSocket: WebSocket | null = null;
+  let activeReader: ReadableStreamDefaultReader<Uint8Array> | undefined;
+  let errorEmitted = false;
+
+  const donePromise = new Promise<void>(async (resolve, reject) => {
+    try {
+      // ── 1. STT ────────────────────────────────────────────────
+      if (isStopped) return resolve();
+      const sttResult = await transcribeAudio(
+        baseUrl, audioFile, projectId, sessionId, "tr",
+      );
+
+      const currentSessionId = sttResult.session_id;
+      const userText = sttResult.text;
+
+      events.onTranscription?.({
+        session_id: currentSessionId,
+        user_text: userText,
+      });
+
+      if (isStopped) return resolve();
+
+      // ── 2. Agent loop via WebSocket ───────────────────────────
+      const assistantText = await new Promise<string>((agentResolve, agentReject) => {
+        if (isStopped) { agentResolve(""); return; }
+
+        const wsUrl = toWebSocketUrl(baseUrl, "/chat/agent/ws");
+        const socket = new WebSocket(wsUrl);
+        activeSocket = socket;
+
+        let finalReply = "";
+        let resolved = false;
+
+        const finish = (reply: string) => {
+          if (resolved) return;
+          resolved = true;
+          agentResolve(reply);
+        };
+
+        const fail = (error: Error) => {
+          if (resolved) return;
+          resolved = true;
+          agentReject(error);
+        };
+
+        socket.onopen = () => {
+          console.info("[Bulut] Agent WS connected");
+          socket.send(JSON.stringify({
+            type: "start",
+            project_id: projectId,
+            session_id: currentSessionId,
+            user_text: userText,
+            model: config.model,
+            page_context: config.pageContext,
+            accessibility_mode: config.accessibilityMode,
+          }));
+        };
+
+        socket.onmessage = async (event) => {
+          let data: Record<string, unknown>;
+          try {
+            data = JSON.parse(String(event.data));
+          } catch {
+            console.warn("[Bulut] Agent WS invalid JSON");
+            return;
+          }
+
+          const msgType = data.type as string;
+
+          if (msgType === "session" && typeof data.session_id === "string") {
+            // Only update session ID – do NOT re-emit user text
+            events.onSessionId?.(data.session_id as string);
+            return;
+          }
+
+          if (msgType === "iteration") {
+            events.onIteration?.(
+              data.iteration as number,
+              data.max_iterations as number,
+            );
+            return;
+          }
+
+          if (msgType === "reply_delta" && typeof data.delta === "string") {
+            events.onAssistantDelta?.(data.delta);
+            return;
+          }
+
+          if (msgType === "tool_calls" && Array.isArray(data.calls)) {
+            const calls = data.calls as AgentToolCallInfo[];
+            events.onToolCalls?.(calls);
+
+            // Execute tools on the frontend and collect results
+            const results: { call_id: string; result: string }[] = [];
+            for (const call of calls) {
+              const result = await executeTool(call);
+              events.onToolResult?.(call.call_id, call.tool, result.result);
+              results.push(result);
+            }
+
+            // Send results back to the agent
+            if (socket.readyState === WebSocket.OPEN) {
+              socket.send(JSON.stringify({
+                type: "tool_results",
+                results,
+              }));
+            }
+            return;
+          }
+
+          if (msgType === "agent_done") {
+            finalReply = (data.final_reply as string) || "";
+            events.onAssistantDone?.(finalReply);
+            // Session ID update only (no re-emit of user text)
+            if (typeof data.session_id === "string") {
+              events.onSessionId?.(data.session_id as string);
+            }
+            finish(finalReply);
+            return;
+          }
+
+          if (msgType === "error") {
+            const errMsg = (data.error as string) || "Agent error";
+            errorEmitted = true;
+            events.onError?.(errMsg);
+            fail(new Error(errMsg));
+            return;
+          }
+        };
+
+        socket.onerror = () => {
+          console.error("[Bulut] Agent WS error");
+          errorEmitted = true;
+          events.onError?.("Agent WebSocket connection error");
+          fail(new Error("Agent WebSocket connection error"));
+        };
+
+        socket.onclose = () => {
+          console.info("[Bulut] Agent WS closed");
+          finish(finalReply);
+        };
+      });
+
+      activeSocket = null;
+
+      // ── 3. TTS ────────────────────────────────────────────────
+      if (isStopped || !assistantText) {
+        return resolve();
+      }
+
+      console.info(
+        `[Bulut] TTS start mode=agent forced_voice=${FORCED_TTS_VOICE}`,
+      );
+
+      events.onAudioStateChange?.("rendering");
+      let ttsResult: TtsCollectResult;
+
+      try {
+        ttsResult = await collectTtsViaWebSocket(
+          baseUrl,
+          assistantText,
+          Boolean(config.accessibilityMode),
+          () => isStopped,
+          (socket) => { activeSocket = socket; },
+        );
+      } catch (wsError) {
+        if (isStopped) return resolve();
+        console.warn(
+          `[Bulut] TTS WS failed, falling back to SSE: ${wsError instanceof Error ? wsError.message : String(wsError)}`,
+        );
+        ttsResult = await collectTtsViaSse(
+          baseUrl,
+          assistantText,
+          Boolean(config.accessibilityMode),
+          () => isStopped,
+          (reader) => { activeReader = reader; },
+        );
+      }
+
+      if (!isStopped && ttsResult.chunks.length > 0) {
+        await playBufferedAudio(
+          ttsResult.chunks,
+          ttsResult.mimeType,
+          ttsResult.sampleRate,
+          events.onAudioStateChange,
+        );
+      } else {
+        events.onAudioStateChange?.("done");
+      }
+
+      resolve();
+    } catch (err) {
+      // Only emit onError if it hasn't been emitted already by the WS handler
+      if (!errorEmitted) {
+        const msg = err instanceof Error ? err.message : String(err);
+        events.onError?.(msg);
+      }
+      reject(err);
+    } finally {
+      activeReader?.cancel().catch(() => { });
+      if (activeSocket && activeSocket.readyState <= WebSocket.OPEN) {
+        activeSocket.close();
+      }
+      activeSocket = null;
+    }
+  });
+
+  return {
+    stop: () => {
+      isStopped = true;
+      if (activeReader) {
+        activeReader.cancel().catch(() => { });
+      }
+      if (activeSocket && activeSocket.readyState <= WebSocket.OPEN) {
+        activeSocket.close();
+      }
+    },
+    done: donePromise,
+  };
+};
+
+// ── Agent Text Chat Stream (no STT, Agent WS → TTS) ────────────────
+
+export const agentTextChatStream = (
+  baseUrl: string,
+  userText: string,
+  projectId: string,
+  sessionId: string | null,
+  config: {
+    model: string;
+    voice: string;
+    pageContext?: string;
+    accessibilityMode?: boolean;
+  },
+  events: AgentVoiceChatEvents,
+  executeTool: (call: AgentToolCallInfo) => Promise<{ call_id: string; result: string }>,
+): StreamController => {
+  let isStopped = false;
+  let activeSocket: WebSocket | null = null;
+  let activeReader: ReadableStreamDefaultReader<Uint8Array> | undefined;
+  let errorEmitted = false;
+
+  const donePromise = new Promise<void>(async (resolve, reject) => {
+    try {
+      if (isStopped) return resolve();
+
+      // ── 1. Agent loop via WebSocket ───────────────────────────
+      const assistantText = await new Promise<string>((agentResolve, agentReject) => {
+        if (isStopped) { agentResolve(""); return; }
+
+        const wsUrl = toWebSocketUrl(baseUrl, "/chat/agent/ws");
+        const socket = new WebSocket(wsUrl);
+        activeSocket = socket;
+
+        let finalReply = "";
+        let resolved = false;
+
+        const finish = (reply: string) => {
+          if (resolved) return;
+          resolved = true;
+          agentResolve(reply);
+        };
+
+        const fail = (error: Error) => {
+          if (resolved) return;
+          resolved = true;
+          agentReject(error);
+        };
+
+        socket.onopen = () => {
+          socket.send(JSON.stringify({
+            type: "start",
+            project_id: projectId,
+            session_id: sessionId,
+            user_text: userText,
+            model: config.model,
+            page_context: config.pageContext,
+            accessibility_mode: config.accessibilityMode,
+          }));
+        };
+
+        socket.onmessage = async (event) => {
+          let data: Record<string, unknown>;
+          try {
+            data = JSON.parse(String(event.data));
+          } catch { return; }
+
+          const msgType = data.type as string;
+
+          if (msgType === "session" && typeof data.session_id === "string") {
+            // Only update session ID – do NOT re-emit user text
+            events.onSessionId?.(data.session_id as string);
+            return;
+          }
+
+          if (msgType === "iteration") {
+            events.onIteration?.(
+              data.iteration as number,
+              data.max_iterations as number,
+            );
+            return;
+          }
+
+          if (msgType === "reply_delta" && typeof data.delta === "string") {
+            events.onAssistantDelta?.(data.delta);
+            return;
+          }
+
+          if (msgType === "tool_calls" && Array.isArray(data.calls)) {
+            const calls = data.calls as AgentToolCallInfo[];
+            events.onToolCalls?.(calls);
+
+            const results: { call_id: string; result: string }[] = [];
+            for (const call of calls) {
+              const result = await executeTool(call);
+              events.onToolResult?.(call.call_id, call.tool, result.result);
+              results.push(result);
+            }
+
+            if (socket.readyState === WebSocket.OPEN) {
+              socket.send(JSON.stringify({
+                type: "tool_results",
+                results,
+              }));
+            }
+            return;
+          }
+
+          if (msgType === "agent_done") {
+            finalReply = (data.final_reply as string) || "";
+            events.onAssistantDone?.(finalReply);
+            if (typeof data.session_id === "string") {
+              events.onSessionId?.(data.session_id as string);
+            }
+            finish(finalReply);
+            return;
+          }
+
+          if (msgType === "error") {
+            const errMsg = (data.error as string) || "Agent error";
+            errorEmitted = true;
+            events.onError?.(errMsg);
+            fail(new Error(errMsg));
+            return;
+          }
+        };
+
+        socket.onerror = () => {
+          errorEmitted = true;
+          events.onError?.("Agent WebSocket error");
+          fail(new Error("Agent WebSocket error"));
+        };
+        socket.onclose = () => finish(finalReply);
+      });
+
+      activeSocket = null;
+
+      // ── 2. TTS ────────────────────────────────────────────────
+      if (isStopped || !assistantText) return resolve();
+
+      events.onAudioStateChange?.("rendering");
+      let ttsResult: TtsCollectResult;
+
+      try {
+        ttsResult = await collectTtsViaWebSocket(
+          baseUrl, assistantText, Boolean(config.accessibilityMode),
+          () => isStopped,
+          (socket) => { activeSocket = socket; },
+        );
+      } catch (wsError) {
+        if (isStopped) return resolve();
+        ttsResult = await collectTtsViaSse(
+          baseUrl, assistantText, Boolean(config.accessibilityMode),
+          () => isStopped,
+          (reader) => { activeReader = reader; },
+        );
+      }
+
+      if (!isStopped && ttsResult.chunks.length > 0) {
+        await playBufferedAudio(
+          ttsResult.chunks, ttsResult.mimeType, ttsResult.sampleRate,
+          events.onAudioStateChange,
+        );
+      } else {
+        events.onAudioStateChange?.("done");
+      }
+
+      resolve();
+    } catch (err) {
+      if (!errorEmitted) {
+        const msg = err instanceof Error ? err.message : String(err);
+        events.onError?.(msg);
+      }
+      reject(err);
+    } finally {
+      activeReader?.cancel().catch(() => { });
+      if (activeSocket && activeSocket.readyState <= WebSocket.OPEN) {
+        activeSocket.close();
+      }
+      activeSocket = null;
+    }
+  });
+
+  return {
+    stop: () => {
+      isStopped = true;
+      if (activeReader) activeReader.cancel().catch(() => { });
+      if (activeSocket && activeSocket.readyState <= WebSocket.OPEN) {
+        activeSocket.close();
+      }
+    },
+    done: donePromise,
+  };
+};

@@ -1,0 +1,75 @@
+{
+  "name": "bulut",
+  "version": "1.0.0",
+  "description": "Bulut – a lightweight AI chatbot widget for React, Next.js and Vite applications",
+  "type": "module",
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.js",
+  "types": "./index.d.ts",
+  "exports": {
+    ".": {
+      "import": {
+        "types": "./index.d.ts",
+        "default": "./dist/index.js"
+      },
+      "require": {
+        "types": "./index.d.ts",
+        "default": "./dist/index.cjs"
+      }
+    },
+    "./embed": {
+      "import": "./dist/embed.js",
+      "require": "./dist/embed.cjs"
+    }
+  },
+  "files": [
+    "dist",
+    "index.d.ts",
+    "README.md"
+  ],
+  "sideEffects": false,
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "test": "vitest run",
+    "prepublishOnly": "npm run build"
+  },
+  "keywords": [
+    "chatbot",
+    "widget",
+    "react",
+    "nextjs",
+    "vite",
+    "preact",
+    "embeddable",
+    "ai"
+  ],
+  "author": "",
+  "license": "MIT",
+  "peerDependencies": {
+    "react": ">=17.0.0",
+    "react-dom": ">=17.0.0"
+  },
+  "peerDependenciesMeta": {
+    "react": {
+      "optional": false
+    },
+    "react-dom": {
+      "optional": false
+    }
+  },
+  "devDependencies": {
+    "@preact/preset-vite": "^2.8.1",
+    "@types/react": "^18.2.0",
+    "@types/react-dom": "^18.2.0",
+    "preact": "^10.19.3",
+    "react": "^18.2.0",
+    "react-dom": "^18.2.0",
+    "streaming-json": "^0.1.4",
+    "terser": "^5.27.0",
+    "typescript": "^5.3.3",
+    "vite": "^5.0.11",
+    "vitest": "^2.1.9"
+  }
+}

@@ -1,0 +1,1273 @@
+import { useEffect, useLayoutEffect, useRef, useState } from "preact/hooks";
+import type { JSX } from "preact";
+import type { BulutRuntimeConfig } from "../index";
+import {
+  agentVoiceChatStream,
+  type AudioStreamState,
+  type StreamController,
+  type AgentToolCallInfo,
+} from "../api/client";
+import {
+  executeSingleToolCall,
+  parseAgentResponse,
+  type ToolCallWithId,
+} from "../agent/tools";
+import { getPageContext } from "../agent/context";
+import {
+  WINDOW_WIDTH,
+  WINDOW_HEIGHT,
+  POSITION_BOTTOM,
+  POSITION_RIGHT,
+  COLORS,
+  TRANSITIONS,
+  BORDER_RADIUS,
+  getContrastIconFilter,
+} from "../styles/constants";
+import { closeIconUrl, microphoneIconUrl, restartIconUrl } from "../assets";
+import { StreamingJsonParser } from "../utils/streamingJson";
+
+interface ChatWindowProps {
+  onClose: () => void;
+  config: BulutRuntimeConfig;
+  targetWindow?: Window;
+  accessibilityMode?: boolean;
+}
+
+interface Message {
+  id: number;
+  text: string;
+  isUser: boolean;
+  /** "message" (default) | "tool" for tool call indicators */
+  type?: "message" | "tool";
+}
+
+type RecordingMode = "vad" | "press";
+
+type StorageLike = {
+  removeItem: (key: string) => void;
+};
+
+const STORAGE_KEY = "bulut_chat_history";
+const TIMESTAMP_KEY = "bulut_chat_timestamp";
+const SESSION_ID_KEY = "bulut_session_id";
+const TTL_MS = 5 * 60 * 1000;
+const VAD_THRESHOLD = 0.06;
+const SILENCE_DURATION_MS = 1000;
+export const HOLD_THRESHOLD_MS = 250;
+
+const STATUS_LABELS = {
+  ready: "Hazır",
+  loading: "Yükleniyor",
+  listening: "Dinliyor...",
+  transcribing: "Metne dönüştürülüyor",
+  thinking: "Düşünüyor...",
+  renderingAudio: "Ses hazırlanıyor",
+  playingAudio: "Ses oynatılıyor",
+  runningTools: "Araç çalıştırılıyor",
+} as const;
+
+export const INITIAL_BOT_MESSAGE_TEXT =
+  "Merhaba, ben Bulut. Bu web sayfasında neler yapalım?";
+
+export interface StatusFlags {
+  isBusy: boolean;
+  isRecording: boolean;
+  isTranscribing: boolean;
+  isThinking: boolean;
+  isRenderingAudio: boolean;
+  isPlayingAudio: boolean;
+  isRunningTools: boolean;
+}
+
+export const resolveStatusText = (flags: StatusFlags): string => {
+  if (flags.isRecording) return STATUS_LABELS.listening;
+  if (flags.isRunningTools) return STATUS_LABELS.runningTools;
+  if (flags.isPlayingAudio) return STATUS_LABELS.playingAudio;
+  if (flags.isRenderingAudio) return STATUS_LABELS.renderingAudio;
+  if (flags.isThinking) return STATUS_LABELS.thinking;
+  if (flags.isTranscribing) return STATUS_LABELS.transcribing;
+  if (flags.isBusy) return STATUS_LABELS.loading;
+  return STATUS_LABELS.ready;
+};
+
+export const formatDurationMs = (durationMs: number): string => {
+  const totalSeconds = Math.max(0, Math.floor(durationMs / 1000));
+  const minutes = Math.floor(totalSeconds / 60)
+    .toString()
+    .padStart(2, "0");
+  const seconds = (totalSeconds % 60).toString().padStart(2, "0");
+  return `${minutes}:${seconds}`;
+};
+
+export const classifyMicGesture = (
+  durationMs: number,
+  thresholdMs: number = HOLD_THRESHOLD_MS,
+): "tap" | "hold" => (durationMs >= thresholdMs ? "hold" : "tap");
+
+export const createInitialMessages = (): Message[] => [
+  {
+    id: 1,
+    text: INITIAL_BOT_MESSAGE_TEXT,
+    isUser: false,
+  },
+];
+
+export const clearPersistedChatState = (storage: StorageLike | null): void => {
+  if (!storage) {
+    return;
+  }
+
+  storage.removeItem(STORAGE_KEY);
+  storage.removeItem(TIMESTAMP_KEY);
+  storage.removeItem(SESSION_ID_KEY);
+};
+
+export const scrollElementToBottom = (
+  element: { scrollTop: number; scrollHeight: number } | null,
+): void => {
+  if (!element) {
+    return;
+  }
+
+  element.scrollTop = element.scrollHeight;
+};
+
+const normalizeError = (error: unknown) => {
+  if (error instanceof Error) {
+    return error.message;
+  }
+  return "Bilinmeyen hata";
+};
+
+const getNextMessageId = (messages: Message[]): number => {
+  const maxId = messages.reduce((acc, message) => Math.max(acc, message.id), 0);
+  return maxId + 1;
+};
+
+export interface AssistantPayloadResolution {
+  displayText: string;
+  toolCalls: ReturnType<typeof parseAgentResponse>["toolCalls"];
+}
+
+export const resolveAssistantPayload = (
+  assistantText: string,
+): AssistantPayloadResolution => {
+  const parsed = parseAgentResponse(assistantText);
+  return {
+    displayText: parsed.reply || assistantText,
+    toolCalls: parsed.toolCalls,
+  };
+};
+
+export const shouldAutoListenAfterAudio = (
+  accessibilityMode: boolean,
+  isRecording: boolean,
+  isBusy: boolean,
+): boolean => accessibilityMode && !isRecording && !isBusy;
+
+export const ChatWindow = ({
+  onClose,
+  config,
+  accessibilityMode = false,
+}: ChatWindowProps) => {
+  const [messages, setMessages] = useState<Message[]>(() => {
+    if (typeof localStorage !== "undefined") {
+      const saved = localStorage.getItem(STORAGE_KEY);
+      const timestamp = localStorage.getItem(TIMESTAMP_KEY);
+
+      if (saved && timestamp) {
+        const timePassed = Date.now() - parseInt(timestamp, 10);
+        if (timePassed < TTL_MS) {
+          try {
+            return JSON.parse(saved) as Message[];
+          } catch {
+            // Ignore parse error and continue with default.
+          }
+        } else {
+          clearPersistedChatState(localStorage);
+        }
+      }
+    }
+
+    return createInitialMessages();
+  });
+
+  const [isBusy, setIsBusy] = useState(false);
+  const [isRecording, setIsRecording] = useState(false);
+  const [isTranscribing, setIsTranscribing] = useState(false);
+  const [isThinking, setIsThinking] = useState(false);
+  const [isRenderingAudio, setIsRenderingAudio] = useState(false);
+  const [isPlayingAudio, setIsPlayingAudio] = useState(false);
+  const [isRunningTools, setIsRunningTools] = useState(false);
+  const [recordingDurationMs, setRecordingDurationMs] = useState(0);
+  const [statusOverride, setStatusOverride] = useState<string | null>(null);
+
+  const resolvedStatusText = resolveStatusText({
+    isBusy,
+    isRecording,
+    isTranscribing,
+    isThinking,
+    isRenderingAudio,
+    isPlayingAudio,
+    isRunningTools,
+  });
+  const statusText = statusOverride ?? resolvedStatusText;
+
+  const isBusyRef = useRef(isBusy);
+  const isRecordingRef = useRef(isRecording);
+
+  const nextMessageIdRef = useRef(getNextMessageId(messages));
+  const recorderRef = useRef<MediaRecorder | null>(null);
+  const streamRef = useRef<MediaStream | null>(null);
+  const audioChunksRef = useRef<BlobPart[]>([]);
+  const activeStreamControllerRef = useRef<StreamController | null>(null);
+  const sessionIdRef = useRef<string | null>(
+    typeof localStorage !== "undefined"
+      ? (() => {
+        const ts = localStorage.getItem(TIMESTAMP_KEY);
+        if (ts && Date.now() - parseInt(ts, 10) < TTL_MS) {
+          return localStorage.getItem(SESSION_ID_KEY);
+        }
+        return null;
+      })()
+      : null,
+  );
+
+  const silenceStartRef = useRef<number | null>(null);
+  const vadIntervalRef = useRef<number | null>(null);
+  const audioContextRef = useRef<AudioContext | null>(null);
+  const sourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
+
+  const discardNextRecordingRef = useRef(false);
+
+  const micPressStartRef = useRef<number | null>(null);
+  const micHoldTimeoutRef = useRef<number | null>(null);
+  const micHoldTriggeredRef = useRef(false);
+  const pendingStopAfterStartRef = useRef(false);
+  const startRecordingPendingRef = useRef(false);
+
+  const assistantMessageIdRef = useRef<number | null>(null);
+  const assistantTextBufferRef = useRef("");
+  const transcriptionReceivedRef = useRef(false);
+  const assistantDoneReceivedRef = useRef(false);
+
+  const recordingStartedAtRef = useRef<number | null>(null);
+  const recordingTimerIntervalRef = useRef<number | null>(null);
+
+  const messagesContainerRef = useRef<HTMLDivElement | null>(null);
+  const messagesContentRef = useRef<HTMLDivElement | null>(null);
+
+  const pendingUserTextRef = useRef<string | null>(null);
+  const pendingAssistantTextRef = useRef<string>("");
+  const streamingJsonParserRef = useRef<StreamingJsonParser | null>(null);
+  const awaitingAssistantResponseRef = useRef(false);
+
+  useEffect(() => {
+    isBusyRef.current = isBusy;
+  }, [isBusy]);
+
+  useEffect(() => {
+    isRecordingRef.current = isRecording;
+  }, [isRecording]);
+
+  useEffect(() => {
+    if (typeof localStorage !== "undefined") {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(messages));
+      localStorage.setItem(TIMESTAMP_KEY, Date.now().toString());
+    }
+  }, [messages]);
+
+  const scrollMessagesToBottom = () => {
+    scrollElementToBottom(messagesContainerRef.current);
+  };
+
+  useLayoutEffect(() => {
+    scrollMessagesToBottom();
+  }, [messages, statusText, isBusy, isRecording]);
+
+  useEffect(() => {
+    const content = messagesContentRef.current;
+    if (!content || typeof ResizeObserver === "undefined") {
+      return;
+    }
+
+    const observer = new ResizeObserver(() => {
+      scrollMessagesToBottom();
+    });
+
+    observer.observe(content);
+    return () => observer.disconnect();
+  }, []);
+
+  const stopRecordingTimer = () => {
+    if (recordingTimerIntervalRef.current !== null) {
+      window.clearInterval(recordingTimerIntervalRef.current);
+      recordingTimerIntervalRef.current = null;
+    }
+    recordingStartedAtRef.current = null;
+  };
+
+  const startRecordingTimer = () => {
+    stopRecordingTimer();
+    recordingStartedAtRef.current = Date.now();
+    setRecordingDurationMs(0);
+
+    recordingTimerIntervalRef.current = window.setInterval(() => {
+      const startedAt = recordingStartedAtRef.current;
+      if (startedAt === null) {
+        setRecordingDurationMs(0);
+        return;
+      }
+      setRecordingDurationMs(Date.now() - startedAt);
+    }, 200);
+  };
+
+  const resetProcessingFlags = () => {
+    setIsTranscribing(false);
+    setIsThinking(false);
+    setIsRenderingAudio(false);
+    setIsPlayingAudio(false);
+    setIsRunningTools(false);
+    setStatusOverride(null);
+    assistantMessageIdRef.current = null;
+    assistantTextBufferRef.current = "";
+    transcriptionReceivedRef.current = false;
+    assistantDoneReceivedRef.current = false;
+    awaitingAssistantResponseRef.current = false;
+    pendingUserTextRef.current = null;
+    pendingAssistantTextRef.current = "";
+  };
+
+  const clearMicHoldTimeout = () => {
+    if (micHoldTimeoutRef.current !== null) {
+      window.clearTimeout(micHoldTimeoutRef.current);
+      micHoldTimeoutRef.current = null;
+    }
+  };
+
+  const cleanupVAD = () => {
+    if (vadIntervalRef.current !== null) {
+      clearInterval(vadIntervalRef.current);
+      vadIntervalRef.current = null;
+    }
+
+    if (sourceRef.current) {
+      sourceRef.current.disconnect();
+      sourceRef.current = null;
+    }
+
+    if (audioContextRef.current) {
+      audioContextRef.current.close().catch(() => { });
+      audioContextRef.current = null;
+    }
+
+    silenceStartRef.current = null;
+  };
+
+  const stopStreamTracks = () => {
+    if (!streamRef.current) {
+      return;
+    }
+
+    streamRef.current.getTracks().forEach((track) => track.stop());
+    streamRef.current = null;
+  };
+
+  const stopActiveStream = () => {
+    if (!activeStreamControllerRef.current) {
+      return;
+    }
+
+    activeStreamControllerRef.current.stop();
+    activeStreamControllerRef.current = null;
+  };
+
+  useEffect(
+    () => () => {
+      clearMicHoldTimeout();
+      pendingStopAfterStartRef.current = false;
+
+      stopActiveStream();
+      cleanupVAD();
+      stopStreamTracks();
+      stopRecordingTimer();
+
+      const recorder = recorderRef.current;
+      if (recorder) {
+        recorder.ondataavailable = null;
+        recorder.onstop = null;
+        recorder.onerror = null;
+        if (recorder.state !== "inactive") {
+          recorder.stop();
+        }
+        recorderRef.current = null;
+      }
+    },
+    [],
+  );
+
+  const appendMessage = (text: string, isUser: boolean): number => {
+    const id = nextMessageIdRef.current++;
+    setMessages((previous) => [
+      ...previous,
+      {
+        id,
+        text,
+        isUser,
+      },
+    ]);
+    return id;
+  };
+
+  const updateMessageText = (id: number, text: string) => {
+    setMessages((previous) =>
+      previous.map((message) =>
+        message.id === id ? { ...message, text } : message,
+      ),
+    );
+  };
+
+  const handleAudioStateChange = (state: AudioStreamState) => {
+    if (state === "rendering") {
+      setIsRenderingAudio(true);
+      setIsPlayingAudio(false);
+      return;
+    }
+
+    if (state === "playing") {
+      setIsRenderingAudio(false);
+      setIsPlayingAudio(true);
+      return;
+    }
+
+    if (state === "fallback") {
+      setIsRenderingAudio(true);
+      setIsPlayingAudio(false);
+      return;
+    }
+
+    if (state === "done") {
+      setIsRenderingAudio(false);
+      setIsPlayingAudio(false);
+      return;
+    }
+
+    setIsRenderingAudio(false);
+    setIsPlayingAudio(false);
+  };
+
+  const handleAudioBlob = async (blob: Blob) => {
+    if (!config.projectId) {
+      appendMessage("Hata: Project ID yapılandırılmamış.", false);
+      return;
+    }
+
+    setIsBusy(true);
+    setIsTranscribing(true);
+    setIsThinking(false);
+    setIsRenderingAudio(false);
+    setIsPlayingAudio(false);
+    setIsRunningTools(false);
+    resetProcessingFlags(); // Start fresh
+    setStatusOverride(STATUS_LABELS.thinking);
+    awaitingAssistantResponseRef.current = true;
+
+    try {
+      const fileType = blob.type || "audio/webm";
+      const extension = fileType.includes("ogg")
+        ? "ogg"
+        : fileType.includes("wav")
+          ? "wav"
+          : fileType.includes("mpeg") || fileType.includes("mp3")
+            ? "mp3"
+            : "webm";
+      const file = new File([blob], `voice-input.${extension}`, {
+        type: fileType,
+      });
+
+      stopActiveStream();
+
+      const pageContext = getPageContext().summary;
+
+      // Helper: bridge an AgentToolCallInfo to a ToolCallWithId
+      const handleToolExecution = async (
+        call: AgentToolCallInfo,
+      ): Promise<{ call_id: string; result: string }> => {
+        const toolCall: ToolCallWithId = {
+          tool: call.tool as "navigate" | "getPageContext" | "interact" | "scroll",
+          call_id: call.call_id,
+          ...call.args,
+        } as ToolCallWithId;
+        return executeSingleToolCall(toolCall);
+      };
+
+      const controller = agentVoiceChatStream(
+        config.backendBaseUrl,
+        file,
+        config.projectId,
+        sessionIdRef.current,
+        {
+          model: config.model,
+          voice: "zeynep",
+          pageContext,
+          accessibilityMode,
+        },
+        {
+          onTranscription: (data) => {
+            if (data.session_id && data.session_id !== sessionIdRef.current) {
+              sessionIdRef.current = data.session_id;
+              if (typeof localStorage !== "undefined") {
+                localStorage.setItem(SESSION_ID_KEY, data.session_id);
+              }
+            }
+
+            // Guard: only append user text once (STT callback fires once)
+            if (
+              data.user_text.trim() &&
+              pendingUserTextRef.current !== data.user_text
+            ) {
+              pendingUserTextRef.current = data.user_text;
+              appendMessage(data.user_text, true);
+            }
+
+            setIsTranscribing(false);
+            setIsThinking(true);
+            setStatusOverride(STATUS_LABELS.thinking);
+          },
+          onSessionId: (sid) => {
+            if (sid && sid !== sessionIdRef.current) {
+              sessionIdRef.current = sid;
+              if (typeof localStorage !== "undefined") {
+                localStorage.setItem(SESSION_ID_KEY, sid);
+              }
+            }
+          },
+          onAssistantDelta: (delta) => {
+            setIsTranscribing(false);
+            setIsThinking(true);
+            if (awaitingAssistantResponseRef.current) {
+              awaitingAssistantResponseRef.current = false;
+              setStatusOverride(null);
+            }
+
+            // Agent returns plain text (not JSON), stream it directly
+            pendingAssistantTextRef.current += delta;
+
+            if (assistantMessageIdRef.current === null) {
+              assistantMessageIdRef.current = appendMessage(
+                pendingAssistantTextRef.current,
+                false,
+              );
+            } else {
+              updateMessageText(
+                assistantMessageIdRef.current,
+                pendingAssistantTextRef.current,
+              );
+            }
+          },
+          onAssistantDone: (assistantText) => {
+            awaitingAssistantResponseRef.current = false;
+            setStatusOverride(null);
+            setIsThinking(false);
+            setIsRenderingAudio(true);
+
+            const finalDisplayText = assistantText || pendingAssistantTextRef.current;
+
+            streamingJsonParserRef.current = null;
+            pendingAssistantTextRef.current = finalDisplayText;
+
+            if (assistantMessageIdRef.current !== null) {
+              updateMessageText(assistantMessageIdRef.current, finalDisplayText);
+            } else {
+              assistantMessageIdRef.current = appendMessage(finalDisplayText, false);
+            }
+          },
+          onToolCalls: (calls) => {
+            setIsRunningTools(true);
+            setStatusOverride(STATUS_LABELS.runningTools);
+
+            // Show each tool call as a small indicator message
+            for (const call of calls) {
+              const toolLabel =
+                call.tool === "navigate"
+                  ? `Sayfaya gidiliyor: ${call.args.url ?? ""}`
+                  : call.tool === "getPageContext"
+                    ? "Sayfa bağlamı alınıyor…"
+                    : call.tool === "interact"
+                      ? `Etkileşim: ${call.args.action ?? ""}`
+                      : call.tool === "scroll"
+                        ? "Kaydırılıyor…"
+                        : call.tool;
+
+              appendMessage(`🔧 ${toolLabel}`, false);
+              // Mark the tool message
+              setMessages((prev) => {
+                const last = prev[prev.length - 1];
+                if (last && !last.isUser) {
+                  return [
+                    ...prev.slice(0, -1),
+                    { ...last, type: "tool" as const },
+                  ];
+                }
+                return prev;
+              });
+            }
+
+            // Reset assistant message ref so next reply gets a new bubble
+            assistantMessageIdRef.current = null;
+            pendingAssistantTextRef.current = "";
+          },
+          onToolResult: (_callId, _toolName, _result) => {
+            // Tool result sent back to agent automatically.
+            // Could display detailed result here if needed.
+          },
+          onIteration: (_iteration, _maxIterations) => {
+            // Agent started a new reasoning iteration
+            setIsThinking(true);
+            setStatusOverride(STATUS_LABELS.thinking);
+          },
+          onAudioStateChange: handleAudioStateChange,
+          onError: (err) => {
+            awaitingAssistantResponseRef.current = false;
+            setStatusOverride(null);
+            appendMessage(`Hata: ${err}`, false);
+          },
+        },
+        handleToolExecution,
+      );
+
+      activeStreamControllerRef.current = controller;
+      await controller.done;
+
+      // Safety: Ensure messages are flushed if not already
+      // (e.g. if audio 'done' event didn't fire for some reason or there was no audio)
+      /* if (pendingUserTextRef.current || pendingAssistantTextRef.current) {
+         // flushPendingMessages(); // Removed as we stream now
+      } */
+
+    } catch (error) {
+      // Error already shown via onError callback — don't duplicate
+      awaitingAssistantResponseRef.current = false;
+      setStatusOverride(null);
+    } finally {
+      awaitingAssistantResponseRef.current = false;
+      setStatusOverride(null);
+      setIsBusy(false);
+      setIsTranscribing(false);
+      setIsThinking(false);
+      setIsRenderingAudio(false);
+      setIsPlayingAudio(false);
+      // Reset for next message cycle
+      pendingUserTextRef.current = null;
+      pendingAssistantTextRef.current = "";
+      assistantMessageIdRef.current = null;
+      if (activeStreamControllerRef.current) {
+        activeStreamControllerRef.current = null;
+      }
+      if (
+        shouldAutoListenAfterAudio(
+          accessibilityMode,
+          isRecordingRef.current,
+          isBusyRef.current,
+        )
+      ) {
+        console.info("[Bulut] chat-window auto-listen trigger after stream completion");
+        void startRecording("vad");
+      }
+    }
+  };
+
+  const stopRecording = (options?: { discard?: boolean }) => {
+    const recorder = recorderRef.current;
+    if (!recorder || recorder.state === "inactive") {
+      return;
+    }
+
+    if (options?.discard) {
+      discardNextRecordingRef.current = true;
+    }
+
+    cleanupVAD();
+    recorder.stop();
+  };
+
+  const setupVAD = (stream: MediaStream, recorder: MediaRecorder) => {
+    const AudioCtx =
+      window.AudioContext ||
+      (window as Window & { webkitAudioContext?: typeof AudioContext })
+        .webkitAudioContext;
+
+    if (!AudioCtx) {
+      return;
+    }
+
+    const context = new AudioCtx();
+    audioContextRef.current = context;
+
+    const analyser = context.createAnalyser();
+    analyser.fftSize = 256;
+
+    const source = context.createMediaStreamSource(stream);
+    sourceRef.current = source;
+    source.connect(analyser);
+
+    const dataArray = new Uint8Array(analyser.frequencyBinCount);
+    silenceStartRef.current = null;
+    let speechDetected = false;
+
+    vadIntervalRef.current = window.setInterval(() => {
+      if (!isRecordingRef.current || recorder.state === "inactive") {
+        cleanupVAD();
+        return;
+      }
+
+      analyser.getByteFrequencyData(dataArray);
+
+      let sum = 0;
+      for (const value of dataArray) {
+        sum += value;
+      }
+      const average = sum / dataArray.length;
+      const volume = average / 255;
+
+      if (volume < VAD_THRESHOLD) {
+        if (silenceStartRef.current === null) {
+          silenceStartRef.current = Date.now();
+          return;
+        }
+
+        const silenceDuration = Date.now() - silenceStartRef.current;
+        if (speechDetected && silenceDuration > SILENCE_DURATION_MS) {
+          stopRecording();
+        }
+        return;
+      }
+
+      speechDetected = true;
+      silenceStartRef.current = null;
+    }, 50);
+  };
+
+  const startRecording = async (mode: RecordingMode) => {
+    if (
+      isBusyRef.current ||
+      isRecordingRef.current ||
+      startRecordingPendingRef.current
+    ) {
+      return;
+    }
+
+    setStatusOverride(STATUS_LABELS.listening);
+
+    if (!navigator.mediaDevices?.getUserMedia) {
+      setStatusOverride(null);
+      appendMessage("Bu tarayıcıda mikrofon kullanılamıyor.", false);
+      return;
+    }
+
+    if (typeof MediaRecorder === "undefined") {
+      setStatusOverride(null);
+      appendMessage("Bu tarayıcıda MediaRecorder desteklenmiyor.", false);
+      return;
+    }
+
+    startRecordingPendingRef.current = true;
+
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      streamRef.current = stream;
+
+      // Use low bitrate for speech — opus handles voice well at 16-24 kbps
+      // and produces ~4-5x smaller payloads, speeding up the upload to fal.
+      const recorderOptions: MediaRecorderOptions = {
+        audioBitsPerSecond: 16_000,
+      };
+
+      // Prefer opus-in-ogg (smaller container) → opus-in-webm → browser default
+      const preferredMimeTypes = [
+        "audio/ogg;codecs=opus",
+        "audio/webm;codecs=opus",
+        "audio/webm",
+      ];
+      for (const mime of preferredMimeTypes) {
+        if (MediaRecorder.isTypeSupported(mime)) {
+          recorderOptions.mimeType = mime;
+          break;
+        }
+      }
+
+      const recorder = new MediaRecorder(stream, recorderOptions);
+      recorderRef.current = recorder;
+      audioChunksRef.current = [];
+
+      recorder.ondataavailable = (event) => {
+        if (event.data.size > 0) {
+          audioChunksRef.current.push(event.data);
+        }
+      };
+
+      recorder.onerror = () => {
+        appendMessage("Mikrofon kaydı sırasında bir hata oluştu.", false);
+      };
+
+      recorder.onstop = async () => {
+        setIsRecording(false);
+        isRecordingRef.current = false;
+        stopRecordingTimer();
+
+        cleanupVAD();
+        stopStreamTracks();
+
+        const shouldDiscard = discardNextRecordingRef.current;
+        discardNextRecordingRef.current = false;
+
+        const blob = new Blob(audioChunksRef.current, {
+          type: recorder.mimeType || "audio/webm",
+        });
+        audioChunksRef.current = [];
+
+        if (shouldDiscard) {
+          setStatusOverride(null);
+          return;
+        }
+
+        if (blob.size === 0) {
+          setStatusOverride(null);
+          appendMessage("Ses kaydı alınamadı. Lütfen tekrar deneyin.", false);
+          return;
+        }
+
+        setStatusOverride(STATUS_LABELS.thinking);
+        await handleAudioBlob(blob);
+      };
+
+      if (mode === "vad") {
+        setupVAD(stream, recorder);
+      }
+
+      recorder.start(200);
+      setIsRecording(true);
+      isRecordingRef.current = true;
+      startRecordingTimer();
+
+      if (pendingStopAfterStartRef.current) {
+        pendingStopAfterStartRef.current = false;
+        stopRecording();
+      }
+    } catch (error) {
+      setStatusOverride(null);
+      appendMessage(`Mikrofon hatası: ${normalizeError(error)}`, false);
+      cleanupVAD();
+      stopStreamTracks();
+      pendingStopAfterStartRef.current = false;
+      setIsRecording(false);
+      isRecordingRef.current = false;
+      stopRecordingTimer();
+    } finally {
+      if (!isRecordingRef.current && !isBusyRef.current) {
+        setStatusOverride(null);
+      }
+      startRecordingPendingRef.current = false;
+    }
+  };
+
+  const resetMicGesture = () => {
+    micPressStartRef.current = null;
+    micHoldTriggeredRef.current = false;
+    clearMicHoldTimeout();
+  };
+
+  const handleMicPointerDown = (
+    event: JSX.TargetedPointerEvent<HTMLButtonElement>,
+  ) => {
+    event.preventDefault();
+
+    if (isBusyRef.current) {
+      return;
+    }
+
+    if (isRecordingRef.current) {
+      stopRecording();
+      return;
+    }
+
+    micPressStartRef.current = Date.now();
+    micHoldTriggeredRef.current = false;
+    clearMicHoldTimeout();
+
+    if (event.currentTarget.setPointerCapture) {
+      try {
+        event.currentTarget.setPointerCapture(event.pointerId);
+      } catch {
+        // No-op.
+      }
+    }
+
+    micHoldTimeoutRef.current = window.setTimeout(() => {
+      if (
+        micPressStartRef.current === null ||
+        isBusyRef.current ||
+        isRecordingRef.current
+      ) {
+        return;
+      }
+
+      micHoldTriggeredRef.current = true;
+      void startRecording("press");
+    }, HOLD_THRESHOLD_MS);
+  };
+
+  const handleMicPointerUp = (
+    event: JSX.TargetedPointerEvent<HTMLButtonElement>,
+  ) => {
+    event.preventDefault();
+
+    if (event.currentTarget.releasePointerCapture) {
+      try {
+        event.currentTarget.releasePointerCapture(event.pointerId);
+      } catch {
+        // No-op.
+      }
+    }
+
+    const startedAt = micPressStartRef.current;
+    const wasHold = micHoldTriggeredRef.current;
+    resetMicGesture();
+
+    if (startedAt === null) {
+      return;
+    }
+
+    if (wasHold) {
+      if (isRecordingRef.current) {
+        stopRecording();
+      } else if (startRecordingPendingRef.current) {
+        pendingStopAfterStartRef.current = true;
+      }
+      return;
+    }
+
+    const duration = Date.now() - startedAt;
+    if (classifyMicGesture(duration) === "tap") {
+      void startRecording("vad");
+    }
+  };
+
+  const handleMicPointerCancel = (
+    event: JSX.TargetedPointerEvent<HTMLButtonElement>,
+  ) => {
+    handleMicPointerUp(event);
+  };
+
+  const handleRestart = () => {
+    resetMicGesture();
+    pendingStopAfterStartRef.current = false;
+
+    stopActiveStream();
+
+    if (recorderRef.current && recorderRef.current.state !== "inactive") {
+      stopRecording({ discard: true });
+    } else {
+      discardNextRecordingRef.current = false;
+      cleanupVAD();
+      stopStreamTracks();
+    }
+
+    stopRecordingTimer();
+    setRecordingDurationMs(0);
+
+    clearPersistedChatState(
+      typeof localStorage !== "undefined" ? localStorage : null,
+    );
+
+    sessionIdRef.current = null;
+    const initialMessages = createInitialMessages();
+    nextMessageIdRef.current = getNextMessageId(initialMessages);
+    setMessages(initialMessages);
+
+    setIsBusy(false);
+    isBusyRef.current = false;
+    setIsRecording(false);
+    isRecordingRef.current = false;
+    resetProcessingFlags();
+  };
+
+  const windowStyle: { [key: string]: string } = {
+    position: "fixed",
+    bottom: `${POSITION_BOTTOM}px`,
+    right: `${POSITION_RIGHT}px`,
+    width: `${WINDOW_WIDTH}px`,
+    maxHeight: `${WINDOW_HEIGHT}px`,
+    backgroundColor: "hsla(0, 0%, 100%, 1)",
+    border: "1px solid rgba(0, 0, 0, 0.1)",
+    borderRadius: BORDER_RADIUS.window,
+    display: "flex",
+    flexDirection: "column",
+    overflow: "hidden",
+    zIndex: "10000",
+    animation: `slideIn ${TRANSITIONS.medium}`,
+    boxShadow: "0 10px 35px rgba(0, 0, 0, 0.18)",
+  };
+
+  const headerStyle: { [key: string]: string } = {
+    padding: "14px 16px",
+    display: "flex",
+    justifyContent: "space-between",
+    alignItems: "center",
+    borderBottom: "1px solid rgba(0,0,0,0.06)",
+  };
+
+  const titleStyle: { [key: string]: string } = {
+    margin: "0",
+    fontSize: "18px",
+    fontWeight: "600",
+    color: COLORS.text,
+  };
+
+  const headerActionsStyle: { [key: string]: string } = {
+    display: "flex",
+    alignItems: "center",
+    gap: "6px",
+  };
+
+  const headerButtonStyle: { [key: string]: string } = {
+    background: "none",
+    border: "none",
+    cursor: "pointer",
+    padding: "4px",
+    borderRadius: "6px",
+    color: COLORS.text,
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "center",
+    transition: `color ${TRANSITIONS.fast}, background-color ${TRANSITIONS.fast}`,
+  };
+
+  const headerIconStyle: { [key: string]: string } = {
+    display: "block",
+    height: "20px",
+    width: "16px",
+  };
+
+  const messagesContainerStyle: { [key: string]: string } = {
+    flex: "1",
+    padding: "10px 16px",
+    overflowY: "auto",
+  };
+
+  const messagesListStyle: { [key: string]: string } = {
+    display: "flex",
+    flexDirection: "column",
+    gap: "14px",
+  };
+
+  const messageStyle = (isUser: boolean): { [key: string]: string } => ({
+    maxWidth: "84%",
+    padding: isUser ? "9px 14px" : "9px 10px",
+    borderRadius: BORDER_RADIUS.message,
+    fontSize: "14px",
+    lineHeight: "1.45",
+    wordWrap: "break-word",
+    whiteSpace: "pre-wrap",
+    alignSelf: isUser ? "flex-end" : "flex-start",
+    backgroundColor: isUser ? COLORS.messageUser : "rgba(0, 0, 0, 0.04)",
+    color: isUser ? COLORS.messageUserText : COLORS.text,
+  });
+
+  const footerStyle: { [key: string]: string } = {
+    padding: "10px 12px",
+    borderTop: "1px solid rgba(0,0,0,0.06)",
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "space-between",
+    gap: "8px",
+  };
+
+  const statusPanelStyle: { [key: string]: string } = {
+    flex: "1",
+    minHeight: "34px",
+    borderRadius: "10px",
+    color: COLORS.text,
+    fontSize: "14px",
+    display: "flex",
+    alignItems: "center",
+    padding: "0 10px",
+    whiteSpace: "nowrap",
+    overflow: "hidden",
+    textOverflow: "ellipsis",
+  };
+
+  const footerActionsStyle: { [key: string]: string } = {
+    display: "flex",
+    alignItems: "center",
+    gap: "8px",
+    flexShrink: "0",
+  };
+
+  const recordingTimerStyle: { [key: string]: string } = {
+    minWidth: "46px",
+    fontSize: "12px",
+    fontWeight: "700",
+    color: COLORS.text,
+    textAlign: "right",
+  };
+
+  const micBackgroundColor = COLORS.primary;
+
+  const micFooterButtonStyle: { [key: string]: string } = {
+    width: "37px",
+    height: "37px",
+    borderRadius: "999px",
+    border: "none",
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "center",
+    cursor: "pointer",
+    color: "#ffffff",
+    background: micBackgroundColor,
+    transition: `background-color ${TRANSITIONS.fast}, transform ${TRANSITIONS.fast}`,
+  };
+
+  const micIconStyle: { [key: string]: string } = {
+    filter: getContrastIconFilter(micBackgroundColor),
+  };
+
+  const disableMicControl = isBusy;
+
+  return (
+    <div style={windowStyle}>
+      <style>{`
+        @keyframes slideIn {
+          from {
+            opacity: 0;
+            transform: translateY(10px);
+          }
+          to {
+            opacity: 1;
+            transform: translateY(0);
+          }
+        }
+
+        .bulut-header-btn:hover:not(:disabled) {
+          background-color: rgba(0, 0, 0, 0.06);
+          color: ${COLORS.text};
+        }
+
+        .bulut-footer-btn:hover:not(:disabled) {
+          transform: scale(1.04);
+        }
+
+        .bulut-header-btn:disabled,
+        .bulut-footer-btn:disabled {
+          cursor: not-allowed;
+          opacity: 0.5;
+          transform: none;
+        }
+      `}</style>
+
+      <div style={headerStyle}>
+        <h3 style={titleStyle}>Bulut</h3>
+        <div style={headerActionsStyle}>
+          <button
+            type="button"
+            className="bulut-header-btn"
+            style={headerButtonStyle}
+            onClick={handleRestart}
+            aria-label="Sohbeti yeniden başlat"
+            title="Sohbeti yeniden başlat"
+          >
+            <img
+              src={restartIconUrl}
+              alt=""
+              aria-hidden="true"
+              style={headerIconStyle}
+            />
+          </button>
+
+          <button
+            type="button"
+            className="bulut-header-btn"
+            style={headerButtonStyle}
+            onClick={onClose}
+            aria-label="Sohbeti kapat"
+            title="Sohbeti kapat"
+          >
+            <img
+              src={closeIconUrl}
+              alt=""
+              aria-hidden="true"
+              style={{
+                ...headerIconStyle,
+                marginTop: "1px",
+
+              }}
+            />
+          </button>
+        </div>
+      </div>
+
+      <div style={messagesContainerStyle} ref={messagesContainerRef}>
+        <div style={messagesListStyle} ref={messagesContentRef}>
+          {messages.map((message) => (
+            <div
+              key={message.id}
+              style={
+                message.type === "tool"
+                  ? {
+                      padding: "5px 12px",
+                      borderRadius: "8px",
+                      fontSize: "12px",
+                      lineHeight: "1.4",
+                      color: "#888",
+                      backgroundColor: "rgba(0, 0, 0, 0.03)",
+                      alignSelf: "flex-start",
+                      maxWidth: "90%",
+                      fontStyle: "italic",
+                    }
+                  : messageStyle(message.isUser)
+              }
+            >
+              {message.text}
+            </div>
+          ))}
+        </div>
+      </div>
+
+      <div style={footerStyle}>
+        <div style={statusPanelStyle} title={statusText}>
+          {statusText}
+        </div>
+
+        <div style={footerActionsStyle}>
+          {isRecording ? (
+            <span style={recordingTimerStyle}>
+              {formatDurationMs(recordingDurationMs)}
+            </span>
+          ) : null}
+          <button
+            type="button"
+            className="bulut-footer-btn"
+            style={micFooterButtonStyle}
+            onPointerDown={handleMicPointerDown}
+            onPointerUp={handleMicPointerUp}
+            onPointerCancel={handleMicPointerCancel}
+            disabled={disableMicControl}
+            aria-label={isRecording ? "Kaydı durdur" : "Kaydı başlat"}
+            title={
+              isRecording
+                ? "Kaydı durdur"
+                : "Dokun: VAD, Basılı tut: bırakınca gönder"
+            }
+          >
+            <img
+              src={microphoneIconUrl}
+              alt=""
+              aria-hidden="true"
+              style={micIconStyle}
+            />
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+};
