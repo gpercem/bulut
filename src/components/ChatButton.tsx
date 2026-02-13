@@ -14,27 +14,23 @@ import { SvgIcon } from "./SvgIcon";
 interface ChatButtonProps {
   onMicClick: () => void;
   onCancelRecording: () => void;
-  onAccessibilityToggle: () => void;
   isRecording: boolean;
   showBubble: boolean;
   onBubbleClick: () => void;
   previewMessage: string | null;
   onPreviewClick: () => void;
   onPreviewClose: () => void;
-  accessibilityEnabled: boolean;
 }
 
 export const ChatButton = ({
   onMicClick,
   onCancelRecording,
-  onAccessibilityToggle,
   isRecording,
   showBubble,
   onBubbleClick,
   previewMessage,
   onPreviewClick,
   onPreviewClose,
-  accessibilityEnabled,
 }: ChatButtonProps) => {
   const bgColor = COLORS.primary;
 
@@ -243,31 +239,6 @@ export const ChatButton = ({
             }}
             aria-label={isRecording ? "Kaydı iptal et" : "Konuşmaya başla"}
           >
-            <span
-              onClick={(event) => {
-                event.stopPropagation();
-                onAccessibilityToggle();
-              }}
-              title={
-                accessibilityEnabled ? "Sesli mod açık" : "Sesli mod kapalı"
-              }
-              aria-label={
-                accessibilityEnabled ? "Sesli modu kapat" : "Sesli modu aç"
-              }
-              style={{
-                position: "absolute",
-                top: "3px",
-                right: "3px",
-                width: "15px",
-                height: "15px",
-                borderRadius: "50%",
-                border: `2px solid ${accessibilityEnabled ? "white" : COLORS.primaryHover}`,
-                backgroundColor: accessibilityEnabled
-                  ? COLORS.primaryHover
-                  : "rgba(255,255,255,1)",
-                cursor: "pointer",
-              }}
-            />
             <SvgIcon
               src={isRecording ? closeIconContent : microphoneIconContent}
               aria-hidden="true"

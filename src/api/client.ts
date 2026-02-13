@@ -276,18 +276,6 @@ const playBufferedAudio = async (
   }
 };
 
-export interface VoiceChatEvents {
-  onSttRequestSent?: () => void;
-  onTranscription?: (data: {
-    session_id: string;
-    user_text: string;
-  }) => void;
-  onAssistantDelta?: (delta: string) => void;
-  onAssistantDone?: (assistantText: string) => void;
-  onAudioStateChange?: (state: AudioStreamState) => void;
-  onError?: (error: string) => void;
-}
-
 export interface StreamController {
   stop: () => void;
   done: Promise<void>;
@@ -596,199 +584,6 @@ const collectTtsViaWebSocket = async (
   throw buildError("tts_ws_exhausted", true);
 };
 
-// ── Orchestrator ────────────────────────────────────────────────────
-
-export const voiceChatStream = (
-  baseUrl: string,
-  audioFile: File,
-  projectId: string,
-  sessionId: string | null,
-  config: {
-    model: string;
-    voice: string;
-    pageContext?: string;
-    accessibilityMode?: boolean;
-  },
-  events: VoiceChatEvents,
-): StreamController => {
-  let isStopped = false;
-  let activeReader: ReadableStreamDefaultReader<Uint8Array> | undefined;
-  let activeSocket: WebSocket | null = null;
-
-  const donePromise = new Promise<void>(async (resolve, reject) => {
-    try {
-      // 1. STT
-      if (isStopped) return resolve();
-      const sttResult = await transcribeAudio(
-        baseUrl,
-        audioFile,
-        projectId,
-        sessionId,
-        "tr",
-        events.onSttRequestSent,
-      );
-
-      const currentSessionId = sttResult.session_id;
-      const userText = sttResult.text;
-
-      events.onTranscription?.({
-        session_id: currentSessionId,
-        user_text: userText,
-      });
-
-      // 2. LLM
-      if (isStopped) return resolve();
-
-      const llmFormData = new FormData();
-      llmFormData.append("project_id", projectId);
-      llmFormData.append("session_id", currentSessionId);
-      llmFormData.append("user_text", userText);
-      llmFormData.append("model", config.model);
-      if (config.pageContext) llmFormData.append("page_context", config.pageContext);
-      llmFormData.append("accessibility_mode", String(Boolean(config.accessibilityMode)));
-
-      const llmResponse = await fetch(`${normalizeBaseUrl(baseUrl)}/chat/llm`, {
-        method: "POST",
-        body: llmFormData,
-      });
-
-      if (!llmResponse.ok) {
-        throw new Error(await parseErrorBody(llmResponse));
-      }
-
-      activeReader = llmResponse.body?.getReader();
-      if (!activeReader) throw new Error("LLM response body is not readable");
-
-      const decoder = new TextDecoder();
-      let buffer = "";
-      let assistantText = "";
-
-      while (true) {
-        if (isStopped) break;
-        const { done, value } = await activeReader.read();
-        if (done) break;
-
-        buffer += decoder.decode(value, { stream: true });
-        const chunks = buffer.split(/\r?\n\r?\n/);
-        buffer = chunks.pop() || "";
-
-        for (const chunk of chunks) {
-          const data = parseSseEventPayload(chunk);
-          if (!data) continue;
-
-          // Capture auto-created session_id from the LLM stream
-          if (data.type === "session" && data.session_id) {
-            events.onTranscription?.({
-              session_id: data.session_id,
-              user_text: sttResult.text,
-            });
-            continue;
-          }
-
-          if (data.type === "llm_delta" && typeof data.delta === "string") {
-            events.onAssistantDelta?.(data.delta);
-            continue;
-          }
-
-          if (data.type === "llm_done") {
-            assistantText = data.assistant_text || "";
-            events.onAssistantDone?.(assistantText);
-            continue;
-          }
-
-          if (data.type === "error") {
-            throw new Error(data.error || "LLM Error");
-          }
-        }
-      }
-
-      // Release LLM reader
-      if (activeReader) {
-        activeReader.releaseLock();
-        activeReader = undefined;
-      }
-
-      // 3. TTS
-      if (isStopped || !assistantText) {
-        // If no assistant text (error?), we can't speak
-        return resolve();
-      }
-      console.info(
-        `[Bulut] TTS start mode=voice voice=${config.voice} accessibility_mode=${Boolean(config.accessibilityMode)}`,
-      );
-
-      // Notify we are starting to render audio (or waiting for it)
-      events.onAudioStateChange?.("rendering");
-      let ttsResult: TtsCollectResult;
-      try {
-        ttsResult = await collectTtsViaWebSocket(
-          baseUrl,
-          assistantText,
-          config.voice,
-          Boolean(config.accessibilityMode),
-          () => isStopped,
-          (socket) => {
-            activeSocket = socket;
-          },
-        );
-      } catch (wsError) {
-        if (isStopped) {
-          return resolve();
-        }
-        console.warn(
-          `[Bulut] TTS WS failed, falling back to SSE: ${wsError instanceof Error ? wsError.message : String(wsError)}`,
-        );
-        ttsResult = await collectTtsViaSse(
-          baseUrl,
-          assistantText,
-          config.voice,
-          Boolean(config.accessibilityMode),
-          () => isStopped,
-          (reader) => {
-            activeReader = reader;
-          },
-        );
-      }
-
-      if (!isStopped && ttsResult.chunks.length > 0) {
-        await playBufferedAudio(
-          ttsResult.chunks,
-          ttsResult.mimeType,
-          ttsResult.sampleRate,
-          events.onAudioStateChange,
-        );
-      } else {
-        events.onAudioStateChange?.("done");
-      }
-
-      resolve();
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      events.onError?.(msg);
-      reject(err);
-    } finally {
-      activeReader?.cancel().catch(() => { });
-      if (activeSocket && activeSocket.readyState <= WebSocket.OPEN) {
-        activeSocket.close();
-      }
-      activeSocket = null;
-    }
-  });
-
-  return {
-    stop: () => {
-      isStopped = true;
-      if (activeReader) {
-        activeReader.cancel().catch(() => { });
-      }
-      if (activeSocket && activeSocket.readyState <= WebSocket.OPEN) {
-        activeSocket.close();
-      }
-    },
-    done: donePromise,
-  };
-};
-
 // ── Agent-mode Types ────────────────────────────────────────────────
 
 export interface AgentToolCallInfo {
@@ -797,7 +592,16 @@ export interface AgentToolCallInfo {
   args: Record<string, unknown>;
 }
 
-export interface AgentVoiceChatEvents extends VoiceChatEvents {
+export interface AgentVoiceChatEvents {
+  onSttRequestSent?: () => void;
+  onTranscription?: (data: {
+    session_id: string;
+    user_text: string;
+  }) => void;
+  onAssistantDelta?: (delta: string) => void;
+  onAssistantDone?: (assistantText: string) => void;
+  onAudioStateChange?: (state: AudioStreamState) => void;
+  onError?: (error: string) => void;
   /** Called when the agent requests tool execution on the frontend. */
   onToolCalls?: (calls: AgentToolCallInfo[]) => void;
   /** Called after each tool has been executed with the result. */

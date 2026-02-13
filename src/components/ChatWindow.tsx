@@ -44,6 +44,7 @@ interface ChatWindowProps {
   onClose: () => void;
   config: BulutRuntimeConfig;
   accessibilityMode?: boolean;
+  onAccessibilityToggle?: () => void;
 }
 
 interface Message {
@@ -191,6 +192,7 @@ export const ChatWindow = ({
   onClose,
   config,
   accessibilityMode = false,
+  onAccessibilityToggle,
 }: ChatWindowProps) => {
   const [messages, setMessages] = useState<Message[]>(() => {
     if (typeof localStorage !== "undefined") {
@@ -1435,6 +1437,20 @@ export const ChatWindow = ({
           opacity: 0.5;
           transform: none;
         }
+
+        @keyframes bulut-dots {
+          0%   { content: '.'; }
+          33%  { content: '..'; }
+          66%  { content: '...'; }
+        }
+
+        .bulut-status-dots::after {
+          content: '.';
+          animation: bulut-dots 1.2s steps(1) infinite;
+          display: inline-block;
+          min-width: 12px;
+          text-align: left;
+        }
       `}</style>
 
       <div style={headerStyle}>
@@ -1507,8 +1523,69 @@ export const ChatWindow = ({
       </div>
 
       <div style={footerStyle}>
-        <div style={{ ...statusPanelStyle, opacity: statusText === "Hazır" ? 0 : 1 , transition: "opacity 0.2s ease-out"}} title={statusText}>
-          {statusText}
+        <div style={{ ...statusPanelStyle, transition: "opacity 0.2s ease-out" }}>
+          {statusText !== STATUS_LABELS.ready ? (
+            <span className="bulut-status-dots" title={statusText}>
+              {statusText}
+            </span>
+          ) : onAccessibilityToggle ? (
+            <div
+              style={{
+                display: "flex",
+                alignItems: "center",
+                gap: "8px",
+              }}
+            >
+              <span
+                style={{
+                  fontSize: "12px",
+                  opacity: "0.6",
+                  whiteSpace: "nowrap",
+                }}
+              >
+                Erişilebilirlik
+              </span>
+              <button
+                type="button"
+                onClick={onAccessibilityToggle}
+                aria-label={
+                  accessibilityMode
+                    ? "Erişilebilirlik modunu kapat"
+                    : "Erişilebilirlik modunu aç"
+                }
+                style={{
+                  width: "36px",
+                  height: "20px",
+                  borderRadius: "10px",
+                  border: "none",
+                  cursor: "pointer",
+                  padding: "2px",
+                  display: "flex",
+                  alignItems: "center",
+                  backgroundColor: accessibilityMode
+                    ? COLORS.primary
+                    : "hsla(215, 10%, 75%, 1)",
+                  transition: `background-color ${TRANSITIONS.fast}`,
+                  flexShrink: "0",
+                }}
+              >
+                <span
+                  style={{
+                    width: "16px",
+                    height: "16px",
+                    borderRadius: "50%",
+                    backgroundColor: "#ffffff",
+                    display: "block",
+                    transition: `transform ${TRANSITIONS.fast}`,
+                    transform: accessibilityMode
+                      ? "translateX(16px)"
+                      : "translateX(0)",
+                    boxShadow: "0 1px 3px rgba(0,0,0,0.2)",
+                  }}
+                />
+              </button>
+            </div>
+          ) : null}
         </div>
 
         <div style={footerActionsStyle}>

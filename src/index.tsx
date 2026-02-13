@@ -4,15 +4,23 @@ import { render } from "preact";
 import { ChatButton } from "./components/ChatButton";
 import {
   ChatWindow,
-  resolveAssistantPayload,
   createInitialMessages,
   getGreetingText,
 } from "./components/ChatWindow";
 import { COLORS } from "./styles/constants";
-import { voiceChatStream, type StreamController } from "./api/client";
+import {
+  agentVoiceChatStream,
+  type StreamController,
+  type AgentToolCallInfo,
+} from "./api/client";
 import { getPageContext } from "./agent/context";
-import { executeToolCalls } from "./agent/tools";
-import { StreamingJsonParser, extractReplyText } from "./utils/streamingJson";
+import { executeSingleToolCall, type ToolCallWithId } from "./agent/tools";
+import {
+  sentSfxUrl,
+  thinkingSfxUrl,
+  toolCallSfxUrl,
+  completedSfxUrl,
+} from "./assets";
 
 export type BulutVoice = "zeynep" | "ali";
 
@@ -255,6 +263,21 @@ const BulutWidget = ({ config }: BulutWidgetProps) => {
   const autoListenSuppressedRef = useRef(false);
   const assistantMsgIdRef = useRef<number | null>(null);
 
+  // Simple SFX helper for button-mode audio feedback
+  const SFX_URLS: Record<string, string> = {
+    sent: sentSfxUrl,
+    thinking: thinkingSfxUrl,
+    toolCall: toolCallSfxUrl,
+    completed: completedSfxUrl,
+  };
+
+  const playSfx = (name: string) => {
+    const url = SFX_URLS[name];
+    if (!url || typeof window === "undefined") return;
+    const audio = new Audio(url);
+    void audio.play().catch(() => {});
+  };
+
   // Show welcome bubble once for 5 seconds
   useEffect(() => {
     if (accessibilityMode) {
@@ -308,15 +331,26 @@ const BulutWidget = ({ config }: BulutWidgetProps) => {
     const sessionId =
       typeof localStorage !== "undefined" ? localStorage.getItem(SESSION_ID_KEY) : null;
     const pageContext = getPageContext().summary;
-    const parser = new StreamingJsonParser();
     assistantMsgIdRef.current = null;
     setIsProcessing(true);
     setPreviewMessage("Düşünüyor...");
     isProcessingRef.current = true;
     console.info(`[Bulut] voice request started accessibility_mode=${mode}`);
 
+    // Bridge an AgentToolCallInfo to a ToolCallWithId for execution
+    const handleToolExecution = async (
+      call: AgentToolCallInfo,
+    ): Promise<{ call_id: string; result: string }> => {
+      const toolCall: ToolCallWithId = {
+        tool: call.tool as "navigate" | "getPageContext" | "interact" | "scroll",
+        call_id: call.call_id,
+        ...call.args,
+      } as ToolCallWithId;
+      return executeSingleToolCall(toolCall);
+    };
+
     try {
-      const controller = voiceChatStream(
+      const controller = agentVoiceChatStream(
         liveConfig.backendBaseUrl,
         file,
         liveConfig.projectId,
@@ -334,37 +368,68 @@ const BulutWidget = ({ config }: BulutWidgetProps) => {
             }
             if (data.user_text?.trim()) {
               appendToStoredMessages(data.user_text, true);
+              playSfx("sent");
+            }
+          },
+          onSessionId: (sid) => {
+            if (sid && typeof localStorage !== "undefined") {
+              localStorage.setItem(SESSION_ID_KEY, sid);
             }
           },
           onAssistantDelta: (delta) => {
-            parser.appendChunk(delta);
-            const text = extractReplyText(parser);
-            if (text) {
+            const current = assistantMsgIdRef.current;
+            if (current === null) {
               clearPreviewTimer();
-              setPreviewMessage(text);
-              if (assistantMsgIdRef.current === null) {
-                assistantMsgIdRef.current = appendToStoredMessages(text, false);
-              } else {
-                updateStoredMessage(assistantMsgIdRef.current, text);
+              assistantMsgIdRef.current = appendToStoredMessages(delta, false);
+              setPreviewMessage(delta);
+            } else {
+              // Read the current text from storage and append delta
+              const saved = typeof localStorage !== "undefined"
+                ? localStorage.getItem(CHAT_STORAGE_KEY) : null;
+              let updatedText = delta;
+              if (saved) {
+                try {
+                  const msgs = JSON.parse(saved) as StoredMessage[];
+                  const existing = msgs.find((m: StoredMessage) => m.id === current);
+                  updatedText = (existing?.text || "") + delta;
+                } catch { /* ignore */ }
               }
+              updateStoredMessage(current, updatedText);
+              setPreviewMessage(updatedText);
             }
           },
           onAssistantDone: (assistantText) => {
-            const resolved = resolveAssistantPayload(assistantText);
-            const finalText = resolved.displayText || assistantText;
             if (assistantMsgIdRef.current !== null) {
-              updateStoredMessage(assistantMsgIdRef.current, finalText);
+              updateStoredMessage(assistantMsgIdRef.current, assistantText);
             } else {
-              appendToStoredMessages(finalText, false);
+              appendToStoredMessages(assistantText, false);
             }
-            setPreviewMessage(finalText);
-
-            // Execute tool calls after the message is fully received
-            if (resolved.toolCalls.length > 0) {
-              void executeToolCalls(resolved.toolCalls).catch((err) => {
-                console.error("Tool execution failed", err);
-              });
+            setPreviewMessage(assistantText);
+            playSfx("completed");
+          },
+          onToolCalls: (calls) => {
+            setPreviewMessage("Araç çalıştırılıyor...");
+            playSfx("toolCall");
+            for (const call of calls) {
+              const toolLabel =
+                call.tool === "navigate"
+                  ? `Sayfaya gidiliyor: ${call.args.url ?? ""}`
+                  : call.tool === "getPageContext"
+                    ? "Sayfa bağlamı alınıyor…"
+                    : call.tool === "interact"
+                      ? `Etkileşim: ${call.args.action ?? ""}`
+                      : call.tool === "scroll"
+                        ? "Kaydırılıyor…"
+                        : call.tool;
+              console.info(`[Bulut] tool call: ${toolLabel}`);
             }
+            // Reset assistant message ref so next reply gets a new entry
+            assistantMsgIdRef.current = null;
+          },
+          onToolResult: () => {},
+          onIteration: () => {
+            setPreviewMessage("Düşünüyor...");
+            playSfx("thinking");
           },
           onAudioStateChange: (state) => {
             console.info(`[Bulut] audio state ${state} accessibility_mode=${mode}`);
@@ -374,6 +439,7 @@ const BulutWidget = ({ config }: BulutWidgetProps) => {
             setPreviewMessage(null);
           },
         },
+        handleToolExecution,
       );
       activeControllerRef.current = controller;
       await controller.done;
@@ -601,14 +667,12 @@ const BulutWidget = ({ config }: BulutWidgetProps) => {
         <ChatButton
           onMicClick={startButtonRecording}
           onCancelRecording={cancelRecording}
-          onAccessibilityToggle={toggleAccessibilityMode}
           isRecording={isRecording}
           showBubble={showBubble}
           onBubbleClick={() => {
             setShowBubble(false);
             toggleWidget();
           }}
-          accessibilityEnabled={isAccessibilityEnabled}
           previewMessage={previewMessage}
           onPreviewClick={() => {
             clearPreviewTimer();
@@ -624,7 +688,8 @@ const BulutWidget = ({ config }: BulutWidgetProps) => {
         <ChatWindow
           onClose={handleClose}
           config={liveConfig}
-          accessibilityMode={accessibilityMode}
+          accessibilityMode={isAccessibilityEnabled}
+          onAccessibilityToggle={toggleAccessibilityMode}
         />
       )}
     </>
