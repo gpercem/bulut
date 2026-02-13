@@ -7,10 +7,12 @@ export const WINDOW_HEIGHT = 500;
 export const POSITION_BOTTOM = 20;
 export const POSITION_RIGHT = 20;
 
-// Colors
+// Colors — initial values match the backend ProjectSettings default.
+// applyTheme() in index.tsx overrides primary/primaryHover/messageUser
+// with the remote config value before the widget renders.
 export const COLORS = {
-  primary: "#006BF8",
-  primaryHover: "#0056C7",
+  primary: "#6C03C1",
+  primaryHover: "#5b02a4",
   background: "#ffffff",
   text: "hsla(215, 100%, 5%, 1)",
   textSecondary: "hsla(215, 100%, 5%, 1)",

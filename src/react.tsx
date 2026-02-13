@@ -2,21 +2,11 @@
 
 import { createElement, useEffect, useRef } from 'react';
 
-export type BulutVoice = 'zeynep' | 'ali';
-
 export interface BulutProps {
   /** The project ID for your Bulut instance (required). */
   projectId: string;
-  /** Backend API URL. Defaults to `"http://localhost:8000"`. */
+  /** Backend API URL. Defaults to `"https://api.bulut.lu"`. */
   backendBaseUrl?: string;
-  /** LLM model identifier. */
-  model?: string;
-  /** Voice for TTS output. */
-  voice?: BulutVoice;
-  /** Primary theme colour as hex, e.g. `"#6C03C1"`. */
-  baseColor?: string;
-  /** Agent display name (max 15 chars). */
-  agentName?: string;
 }
 
 /**
@@ -37,10 +27,6 @@ export interface BulutProps {
 export function Bulut({
   projectId,
   backendBaseUrl,
-  model,
-  voice,
-  baseColor,
-  agentName,
 }: BulutProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const containerIdRef = useRef(
@@ -67,10 +53,6 @@ export function Bulut({
         containerId,
         projectId,
         backendBaseUrl,
-        model,
-        voice,
-        baseColor,
-        agentName,
       });
 
       cleanup = () => mod.destroy();
@@ -80,7 +62,7 @@ export function Bulut({
       destroyed = true;
       cleanup?.();
     };
-  }, [projectId, backendBaseUrl, model, voice, baseColor, agentName]);
+  }, [projectId, backendBaseUrl]);
 
   // Plain createElement – no JSX – so this file stays free of the
   // Preact JSX transform and keeps real React imports.

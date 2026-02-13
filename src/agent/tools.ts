@@ -17,6 +17,7 @@ export interface PendingAgentResume {
   sessionId: string;
   projectId: string;
   model: string;
+  voice: string;
   accessibilityMode: boolean;
   pendingToolCalls: Array<{
     call_id: string;

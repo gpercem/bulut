@@ -6,7 +6,7 @@ import {
   ChatWindow,
   resolveAssistantPayload,
   createInitialMessages,
-  INITIAL_BOT_MESSAGE_TEXT,
+  getGreetingText,
 } from "./components/ChatWindow";
 import { COLORS } from "./styles/constants";
 import { voiceChatStream, type StreamController } from "./api/client";
@@ -20,10 +20,6 @@ export interface BulutOptions {
   containerId?: string;
   backendBaseUrl?: string;
   projectId?: string;
-  model?: string;
-  voice?: BulutVoice;
-  baseColor?: string;
-  agentName?: string;
 }
 
 export interface BulutRuntimeConfig {
@@ -36,7 +32,7 @@ export interface BulutRuntimeConfig {
 }
 
 /** Default LLM model — keep in sync with backend config.DEFAULT_LLM_MODEL */
-const DEFAULT_LLM_MODEL = "google/gemini-3-flash-preview:nitro";
+const DEFAULT_LLM_MODEL = "x-ai/grok-4.1-fast";
 
 const DEFAULT_AGENT_NAME = "Bulut";
 
@@ -93,6 +89,7 @@ interface RemoteProjectConfig {
   base_color: string;
   model: string;
   agent_name: string;
+  voice: string;
 }
 
 const fetchRemoteConfig = async (
@@ -111,17 +108,14 @@ const fetchRemoteConfig = async (
 
 const resolveRuntimeConfig = (
   options: BulutOptions,
-): BulutRuntimeConfig => {
-  const voice = options.voice === "zeynep" ? "zeynep" : "ali";
-  return {
-    backendBaseUrl: options.backendBaseUrl || DEFAULT_CONFIG.backendBaseUrl,
-    projectId: options.projectId || DEFAULT_CONFIG.projectId,
-    model: options.model || DEFAULT_CONFIG.model,
-    voice,
-    baseColor: normalizeHexColor(options.baseColor || DEFAULT_CONFIG.baseColor),
-    agentName: options.agentName || DEFAULT_CONFIG.agentName,
-  };
-};
+): BulutRuntimeConfig => ({
+  backendBaseUrl: options.backendBaseUrl || DEFAULT_CONFIG.backendBaseUrl,
+  projectId: options.projectId || DEFAULT_CONFIG.projectId,
+  model: DEFAULT_CONFIG.model,
+  voice: DEFAULT_CONFIG.voice,
+  baseColor: DEFAULT_CONFIG.baseColor,
+  agentName: DEFAULT_CONFIG.agentName,
+});
 
 interface BulutWidgetProps {
   config: BulutRuntimeConfig;
@@ -158,7 +152,7 @@ interface StoredMessage {
   isUser: boolean;
 }
 
-const appendToStoredMessages = (text: string, isUser: boolean): number => {
+const appendToStoredMessages = (text: string, isUser: boolean, agentName: string = DEFAULT_AGENT_NAME): number => {
   let messages: StoredMessage[] = [];
   if (typeof localStorage !== "undefined") {
     const saved = localStorage.getItem(CHAT_STORAGE_KEY);
@@ -167,7 +161,7 @@ const appendToStoredMessages = (text: string, isUser: boolean): number => {
     }
   }
   if (messages.length === 0) {
-    messages = createInitialMessages();
+    messages = createInitialMessages(agentName);
   }
   const id = messages.reduce((a, m) => Math.max(a, m.id), 0) + 1;
   messages.push({ id, text, isUser });
@@ -193,22 +187,30 @@ const updateStoredMessage = (id: number, text: string) => {
 const BulutWidget = ({ config }: BulutWidgetProps) => {
   // Live config that merges remote settings over initial config
   const [liveConfig, setLiveConfig] = useState<BulutRuntimeConfig>(config);
+  const [configReady, setConfigReady] = useState(false);
 
-  // Fetch remote project config on mount
+  // Fetch remote project config on mount — widget stays hidden until done
   useEffect(() => {
-    if (!config.projectId) return;
+    if (!config.projectId) {
+      setConfigReady(true);
+      return;
+    }
     let cancelled = false;
 
     fetchRemoteConfig(config.backendBaseUrl, config.projectId).then((remote) => {
-      if (cancelled || !remote) return;
-      const merged: BulutRuntimeConfig = {
-        ...config,
-        baseColor: normalizeHexColor(remote.base_color || config.baseColor),
-        model: remote.model || config.model,
-        agentName: remote.agent_name || config.agentName,
-      };
-      applyTheme(merged.baseColor);
-      setLiveConfig(merged);
+      if (cancelled) return;
+      if (remote) {
+        const merged: BulutRuntimeConfig = {
+          ...config,
+          baseColor: normalizeHexColor(remote.base_color || config.baseColor),
+          model: remote.model || config.model,
+          agentName: remote.agent_name || config.agentName,
+          voice: (remote.voice === "zeynep" || remote.voice === "ali" ? remote.voice : config.voice) as BulutVoice,
+        };
+        applyTheme(merged.baseColor);
+        setLiveConfig(merged);
+      }
+      setConfigReady(true);
     });
 
     return () => { cancelled = true; };
@@ -231,10 +233,14 @@ const BulutWidget = ({ config }: BulutWidgetProps) => {
     }
     return localStorage.getItem(ACCESSIBILITY_MODE_KEY) === "true";
   });
-  const [previewMessage, setPreviewMessage] = useState<string | null>(
-    INITIAL_BOT_MESSAGE_TEXT,
-  );
+  const [previewMessage, setPreviewMessage] = useState<string | null>(null);
   const accessibilityMode = isAccessibilityEnabled && !isOpen;
+
+  // Set initial preview message once config is ready
+  useEffect(() => {
+    if (!configReady) return;
+    setPreviewMessage(getGreetingText(liveConfig.agentName));
+  }, [configReady, liveConfig.agentName]);
 
   const recorderRef = useRef<MediaRecorder | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
@@ -317,7 +323,7 @@ const BulutWidget = ({ config }: BulutWidgetProps) => {
         sessionId,
         {
           model: liveConfig.model,
-          voice: "zeynep",
+          voice: liveConfig.voice,
           pageContext,
           accessibilityMode: mode,
         },
@@ -527,7 +533,7 @@ const BulutWidget = ({ config }: BulutWidgetProps) => {
   const handleClose = () => {
     setIsOpen(false);
     if (!previewMessage) {
-      setPreviewMessage(INITIAL_BOT_MESSAGE_TEXT);
+      setPreviewMessage(getGreetingText(liveConfig.agentName));
     }
     if (typeof localStorage !== "undefined") {
       localStorage.setItem("bulut_panel_open", "false");
@@ -586,6 +592,8 @@ const BulutWidget = ({ config }: BulutWidgetProps) => {
       window.clearTimeout(timer);
     };
   }, [accessibilityMode, isRecording, isProcessing]);
+
+  if (!configReady) return null;
 
   return (
     <>

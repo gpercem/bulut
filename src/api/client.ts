@@ -45,7 +45,6 @@ interface TtsWsEventPayload {
 
 export type AudioStreamState = "rendering" | "playing" | "done" | "fallback";
 export const TTS_WS_RETRY_DELAYS_MS = [250, 750, 1500];
-const FORCED_TTS_VOICE = "zeynep";
 
 const normalizeBaseUrl = (baseUrl: string): string => {
   const trimmed = baseUrl.trim().replace(/\/+$/, "");
@@ -286,12 +285,6 @@ export interface VoiceChatEvents {
   onAssistantDone?: (assistantText: string) => void;
   onAudioStateChange?: (state: AudioStreamState) => void;
   onError?: (error: string) => void;
-  // Backward compatibility for old callers.
-  onMetadata?: (data: {
-    session_id: string;
-    user_text: string;
-    assistant_text: string;
-  }) => void;
 }
 
 export interface StreamController {
@@ -367,13 +360,14 @@ const buildError = (message: string, retryable: boolean = true): Error & { retry
 const collectTtsViaSse = async (
   baseUrl: string,
   assistantText: string,
+  voice: string,
   accessibilityMode: boolean,
   isStopped: () => boolean,
   setReader: (reader: ReadableStreamDefaultReader<Uint8Array> | undefined) => void,
 ): Promise<TtsCollectResult> => {
   const ttsFormData = new FormData();
   ttsFormData.append("text", assistantText);
-  ttsFormData.append("voice", FORCED_TTS_VOICE);
+  ttsFormData.append("voice", voice);
   ttsFormData.append("accessibility_mode", String(accessibilityMode));
 
   const ttsResponse = await fetch(`${normalizeBaseUrl(baseUrl)}/chat/tts`, {
@@ -438,6 +432,7 @@ const collectTtsViaSse = async (
 const collectTtsViaWebSocket = async (
   baseUrl: string,
   assistantText: string,
+  voice: string,
   accessibilityMode: boolean,
   isStopped: () => boolean,
   setSocket: (socket: WebSocket | null) => void,
@@ -486,7 +481,7 @@ const collectTtsViaWebSocket = async (
             type: "start",
             request_id: requestId,
             text: assistantText,
-            voice: FORCED_TTS_VOICE,
+            voice,
             accessibility_mode: accessibilityMode,
             last_seq: highestSeqSeen,
           }),
@@ -708,7 +703,7 @@ export const voiceChatStream = (
         return resolve();
       }
       console.info(
-        `[Bulut] TTS start mode=voice requested_voice=${config.voice} forced_voice=${FORCED_TTS_VOICE} accessibility_mode=${Boolean(config.accessibilityMode)}`,
+        `[Bulut] TTS start mode=voice voice=${config.voice} accessibility_mode=${Boolean(config.accessibilityMode)}`,
       );
 
       // Notify we are starting to render audio (or waiting for it)
@@ -718,6 +713,7 @@ export const voiceChatStream = (
         ttsResult = await collectTtsViaWebSocket(
           baseUrl,
           assistantText,
+          config.voice,
           Boolean(config.accessibilityMode),
           () => isStopped,
           (socket) => {
@@ -734,178 +730,7 @@ export const voiceChatStream = (
         ttsResult = await collectTtsViaSse(
           baseUrl,
           assistantText,
-          Boolean(config.accessibilityMode),
-          () => isStopped,
-          (reader) => {
-            activeReader = reader;
-          },
-        );
-      }
-
-      if (!isStopped && ttsResult.chunks.length > 0) {
-        await playBufferedAudio(
-          ttsResult.chunks,
-          ttsResult.mimeType,
-          ttsResult.sampleRate,
-          events.onAudioStateChange,
-        );
-      } else {
-        events.onAudioStateChange?.("done");
-      }
-
-      resolve();
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      events.onError?.(msg);
-      reject(err);
-    } finally {
-      activeReader?.cancel().catch(() => { });
-      if (activeSocket && activeSocket.readyState <= WebSocket.OPEN) {
-        activeSocket.close();
-      }
-      activeSocket = null;
-    }
-  });
-
-  return {
-    stop: () => {
-      isStopped = true;
-      if (activeReader) {
-        activeReader.cancel().catch(() => { });
-      }
-      if (activeSocket && activeSocket.readyState <= WebSocket.OPEN) {
-        activeSocket.close();
-      }
-    },
-    done: donePromise,
-  };
-};
-
-// ── Text-only orchestrator (browser STT path) ───────────────────────
-// Skips /chat/stt — accepts pre-transcribed text and goes straight to
-// LLM + TTS.  Session is auto-created on the backend when sessionId
-// is null.
-
-export const textChatStream = (
-  baseUrl: string,
-  userText: string,
-  projectId: string,
-  sessionId: string | null,
-  config: {
-    model: string;
-    voice: string;
-    pageContext?: string;
-    accessibilityMode?: boolean;
-  },
-  events: VoiceChatEvents,
-): StreamController => {
-  let isStopped = false;
-  let activeReader: ReadableStreamDefaultReader<Uint8Array> | undefined;
-  let activeSocket: WebSocket | null = null;
-
-  const donePromise = new Promise<void>(async (resolve, reject) => {
-    try {
-      // 1. LLM
-      if (isStopped) return resolve();
-
-      const llmFormData = new FormData();
-      llmFormData.append("project_id", projectId);
-      if (sessionId) llmFormData.append("session_id", sessionId);
-      llmFormData.append("user_text", userText);
-      llmFormData.append("model", config.model);
-      if (config.pageContext) llmFormData.append("page_context", config.pageContext);
-      llmFormData.append("accessibility_mode", String(Boolean(config.accessibilityMode)));
-
-      const llmResponse = await fetch(`${normalizeBaseUrl(baseUrl)}/chat/llm`, {
-        method: "POST",
-        body: llmFormData,
-      });
-
-      if (!llmResponse.ok) {
-        throw new Error(await parseErrorBody(llmResponse));
-      }
-
-      activeReader = llmResponse.body?.getReader();
-      if (!activeReader) throw new Error("LLM response body is not readable");
-
-      const decoder = new TextDecoder();
-      let buffer = "";
-      let assistantText = "";
-
-      while (true) {
-        if (isStopped) break;
-        const { done, value } = await activeReader.read();
-        if (done) break;
-
-        buffer += decoder.decode(value, { stream: true });
-        const chunks = buffer.split(/\r?\n\r?\n/);
-        buffer = chunks.pop() || "";
-
-        for (const chunk of chunks) {
-          const data = parseSseEventPayload(chunk);
-          if (!data) continue;
-
-          // Capture auto-created session_id
-          if (data.type === "session" && data.session_id) {
-            events.onTranscription?.({
-              session_id: data.session_id,
-              user_text: userText,
-            });
-            continue;
-          }
-
-          if (data.type === "llm_delta" && typeof data.delta === "string") {
-            events.onAssistantDelta?.(data.delta);
-            continue;
-          }
-
-          if (data.type === "llm_done") {
-            assistantText = data.assistant_text || "";
-            events.onAssistantDone?.(assistantText);
-            continue;
-          }
-
-          if (data.type === "error") {
-            throw new Error(data.error || "LLM Error");
-          }
-        }
-      }
-
-      if (activeReader) {
-        activeReader.releaseLock();
-        activeReader = undefined;
-      }
-
-      // 2. TTS
-      if (isStopped || !assistantText) {
-        return resolve();
-      }
-      console.info(
-        `[Bulut] TTS start mode=text requested_voice=${config.voice} forced_voice=${FORCED_TTS_VOICE} accessibility_mode=${Boolean(config.accessibilityMode)}`,
-      );
-
-      events.onAudioStateChange?.("rendering");
-      let ttsResult: TtsCollectResult;
-      try {
-        ttsResult = await collectTtsViaWebSocket(
-          baseUrl,
-          assistantText,
-          Boolean(config.accessibilityMode),
-          () => isStopped,
-          (socket) => {
-            activeSocket = socket;
-          },
-        );
-      } catch (wsError) {
-        if (isStopped) {
-          return resolve();
-        }
-        console.warn(
-          `[Bulut] TTS WS failed, falling back to SSE: ${wsError instanceof Error ? wsError.message : String(wsError)}`,
-        );
-        ttsResult = await collectTtsViaSse(
-          baseUrl,
-          assistantText,
+          config.voice,
           Boolean(config.accessibilityMode),
           () => isStopped,
           (reader) => {
@@ -1091,6 +916,7 @@ export const agentVoiceChatStream = (
                   sessionId: effectiveSessionId,
                   projectId,
                   model: config.model,
+                  voice: config.voice,
                   accessibilityMode: Boolean(config.accessibilityMode),
                   pendingToolCalls: calls.map((c) => ({
                     call_id: c.call_id,
@@ -1161,7 +987,7 @@ export const agentVoiceChatStream = (
       }
 
       console.info(
-        `[Bulut] TTS start mode=agent forced_voice=${FORCED_TTS_VOICE}`,
+        `[Bulut] TTS start mode=agent voice=${config.voice}`,
       );
 
       events.onAudioStateChange?.("rendering");
@@ -1171,6 +997,7 @@ export const agentVoiceChatStream = (
         ttsResult = await collectTtsViaWebSocket(
           baseUrl,
           assistantText,
+          config.voice,
           Boolean(config.accessibilityMode),
           () => isStopped,
           (socket) => { activeSocket = socket; },
@@ -1183,6 +1010,7 @@ export const agentVoiceChatStream = (
         ttsResult = await collectTtsViaSse(
           baseUrl,
           assistantText,
+          config.voice,
           Boolean(config.accessibilityMode),
           () => isStopped,
           (reader) => { activeReader = reader; },
@@ -1331,6 +1159,7 @@ export const agentTextChatStream = (
                   sessionId: effectiveSessionId,
                   projectId,
                   model: config.model,
+                  voice: config.voice,
                   accessibilityMode: Boolean(config.accessibilityMode),
                   pendingToolCalls: calls.map((c) => ({
                     call_id: c.call_id,
@@ -1397,14 +1226,14 @@ export const agentTextChatStream = (
 
       try {
         ttsResult = await collectTtsViaWebSocket(
-          baseUrl, assistantText, Boolean(config.accessibilityMode),
+          baseUrl, assistantText, config.voice, Boolean(config.accessibilityMode),
           () => isStopped,
           (socket) => { activeSocket = socket; },
         );
       } catch (wsError) {
         if (isStopped) return resolve();
         ttsResult = await collectTtsViaSse(
-          baseUrl, assistantText, Boolean(config.accessibilityMode),
+          baseUrl, assistantText, config.voice, Boolean(config.accessibilityMode),
           () => isStopped,
           (reader) => { activeReader = reader; },
         );
@@ -1566,6 +1395,7 @@ export const agentResumeStream = (
                   sessionId: effectiveSessionId,
                   projectId: resumeState.projectId,
                   model: resumeState.model,
+                  voice: resumeState.voice,
                   accessibilityMode: resumeState.accessibilityMode,
                   pendingToolCalls: calls.map((c) => ({
                     call_id: c.call_id,
@@ -1625,13 +1455,13 @@ export const agentResumeStream = (
       // ── TTS ────────────────────────────────────────────────
       if (isStopped || !assistantText) return resolve();
 
-      console.info(`[Bulut] TTS start mode=resume forced_voice=${FORCED_TTS_VOICE}`);
+      console.info(`[Bulut] TTS start mode=resume voice=${resumeState.voice}`);
       events.onAudioStateChange?.("rendering");
       let ttsResult: TtsCollectResult;
 
       try {
         ttsResult = await collectTtsViaWebSocket(
-          baseUrl, assistantText, Boolean(resumeState.accessibilityMode),
+          baseUrl, assistantText, resumeState.voice, Boolean(resumeState.accessibilityMode),
           () => isStopped,
           (socket) => { activeSocket = socket; },
         );
@@ -1641,7 +1471,7 @@ export const agentResumeStream = (
           `[Bulut] TTS WS failed, falling back to SSE: ${wsError instanceof Error ? wsError.message : String(wsError)}`,
         );
         ttsResult = await collectTtsViaSse(
-          baseUrl, assistantText, Boolean(resumeState.accessibilityMode),
+          baseUrl, assistantText, resumeState.voice, Boolean(resumeState.accessibilityMode),
           () => isStopped,
           (reader) => { activeReader = reader; },
         );

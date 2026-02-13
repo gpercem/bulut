@@ -58,10 +58,10 @@ describe("restart helpers", () => {
   });
 
   it("creates the initial welcome message", () => {
-    const messages = createInitialMessages();
+    const messages = createInitialMessages("Bulut");
     expect(messages).toHaveLength(1);
     expect(messages[0].isUser).toBe(false);
-    expect(messages[0].text.length).toBeGreaterThan(0);
+    expect(messages[0].text).toContain("Bulut");
   });
 });
 

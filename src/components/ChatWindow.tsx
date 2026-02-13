@@ -39,7 +39,6 @@ import { SvgIcon } from "./SvgIcon";
 interface ChatWindowProps {
   onClose: () => void;
   config: BulutRuntimeConfig;
-  targetWindow?: Window;
   accessibilityMode?: boolean;
 }
 
@@ -76,8 +75,8 @@ const STATUS_LABELS = {
   runningTools: "Araç çalıştırılıyor",
 } as const;
 
-export const INITIAL_BOT_MESSAGE_TEXT =
-  "Merhaba, ben Bulut. Bu web sayfasında neler yapalım?";
+export const getGreetingText = (agentName: string): string =>
+  `Merhaba, ben ${agentName}. Bu web sayfasında neler yapalım?`;
 
 export interface StatusFlags {
   isBusy: boolean;
@@ -114,10 +113,10 @@ export const classifyMicGesture = (
   thresholdMs: number = HOLD_THRESHOLD_MS,
 ): "tap" | "hold" => (durationMs >= thresholdMs ? "hold" : "tap");
 
-export const createInitialMessages = (): Message[] => [
+export const createInitialMessages = (agentName: string): Message[] => [
   {
     id: 1,
-    text: INITIAL_BOT_MESSAGE_TEXT,
+    text: getGreetingText(agentName),
     isUser: false,
   },
 ];
@@ -199,7 +198,7 @@ export const ChatWindow = ({
       }
     }
 
-    return createInitialMessages();
+    return createInitialMessages(config.agentName);
   });
 
   const [isBusy, setIsBusy] = useState(false);
@@ -681,7 +680,7 @@ export const ChatWindow = ({
         sessionIdRef.current,
         {
           model: config.model,
-          voice: "zeynep",
+          voice: config.voice,
           pageContext,
           accessibilityMode,
         },
@@ -1162,7 +1161,7 @@ export const ChatWindow = ({
     );
 
     sessionIdRef.current = null;
-    const initialMessages = createInitialMessages();
+    const initialMessages = createInitialMessages(config.agentName);
     nextMessageIdRef.current = getNextMessageId(initialMessages);
     setMessages(initialMessages);
 
@@ -1398,7 +1397,7 @@ export const ChatWindow = ({
           {statusText}
         </div>
 
-        <div className='bebek' style={footerActionsStyle}>
+        <div style={footerActionsStyle}>
           {isRecording ? (
             <span style={recordingTimerStyle}>
               {formatDurationMs(recordingDurationMs)}
