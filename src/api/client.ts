@@ -1,3 +1,9 @@
+import {
+  savePendingAgentResume,
+  clearPendingAgentResume,
+  type PendingAgentResume,
+} from "../agent/tools";
+
 export type ChatRole = "system" | "user" | "assistant";
 
 export interface ChatMessage {
@@ -996,6 +1002,7 @@ export const agentVoiceChatStream = (
       );
 
       const currentSessionId = sttResult.session_id;
+      let effectiveSessionId = currentSessionId;
       const userText = sttResult.text;
 
       events.onTranscription?.({
@@ -1053,8 +1060,8 @@ export const agentVoiceChatStream = (
           const msgType = data.type as string;
 
           if (msgType === "session" && typeof data.session_id === "string") {
-            // Only update session ID – do NOT re-emit user text
-            events.onSessionId?.(data.session_id as string);
+            effectiveSessionId = data.session_id as string;
+            events.onSessionId?.(effectiveSessionId);
             return;
           }
 
@@ -1075,15 +1082,36 @@ export const agentVoiceChatStream = (
             const calls = data.calls as AgentToolCallInfo[];
             events.onToolCalls?.(calls);
 
-            // Execute tools on the frontend and collect results
             const results: { call_id: string; result: string }[] = [];
             for (const call of calls) {
+              // Save resume state before navigate in case of full-page reload
+              const isNavigate = call.tool === "navigate";
+              if (isNavigate) {
+                savePendingAgentResume({
+                  sessionId: effectiveSessionId,
+                  projectId,
+                  model: config.model,
+                  accessibilityMode: Boolean(config.accessibilityMode),
+                  pendingToolCalls: calls.map((c) => ({
+                    call_id: c.call_id,
+                    tool: c.tool,
+                    args: c.args,
+                  })),
+                  completedResults: [...results],
+                });
+              }
+
               const result = await executeTool(call);
+
+              // If we reach here, no full-page reload happened
+              if (isNavigate) {
+                clearPendingAgentResume();
+              }
+
               events.onToolResult?.(call.call_id, call.tool, result.result);
               results.push(result);
             }
 
-            // Send results back to the agent
             if (socket.readyState === WebSocket.OPEN) {
               socket.send(JSON.stringify({
                 type: "tool_results",
@@ -1096,7 +1124,6 @@ export const agentVoiceChatStream = (
           if (msgType === "agent_done") {
             finalReply = (data.final_reply as string) || "";
             events.onAssistantDone?.(finalReply);
-            // Session ID update only (no re-emit of user text)
             if (typeof data.session_id === "string") {
               events.onSessionId?.(data.session_id as string);
             }
@@ -1239,6 +1266,7 @@ export const agentTextChatStream = (
 
         let finalReply = "";
         let resolved = false;
+        let effectiveSessionId = sessionId || "";
 
         const finish = (reply: string) => {
           if (resolved) return;
@@ -1273,8 +1301,8 @@ export const agentTextChatStream = (
           const msgType = data.type as string;
 
           if (msgType === "session" && typeof data.session_id === "string") {
-            // Only update session ID – do NOT re-emit user text
-            events.onSessionId?.(data.session_id as string);
+            effectiveSessionId = data.session_id as string;
+            events.onSessionId?.(effectiveSessionId);
             return;
           }
 
@@ -1297,7 +1325,28 @@ export const agentTextChatStream = (
 
             const results: { call_id: string; result: string }[] = [];
             for (const call of calls) {
+              const isNavigate = call.tool === "navigate";
+              if (isNavigate) {
+                savePendingAgentResume({
+                  sessionId: effectiveSessionId,
+                  projectId,
+                  model: config.model,
+                  accessibilityMode: Boolean(config.accessibilityMode),
+                  pendingToolCalls: calls.map((c) => ({
+                    call_id: c.call_id,
+                    tool: c.tool,
+                    args: c.args,
+                  })),
+                  completedResults: [...results],
+                });
+              }
+
               const result = await executeTool(call);
+
+              if (isNavigate) {
+                clearPendingAgentResume();
+              }
+
               events.onToolResult?.(call.call_id, call.tool, result.result);
               results.push(result);
             }
@@ -1356,6 +1405,243 @@ export const agentTextChatStream = (
         if (isStopped) return resolve();
         ttsResult = await collectTtsViaSse(
           baseUrl, assistantText, Boolean(config.accessibilityMode),
+          () => isStopped,
+          (reader) => { activeReader = reader; },
+        );
+      }
+
+      if (!isStopped && ttsResult.chunks.length > 0) {
+        await playBufferedAudio(
+          ttsResult.chunks, ttsResult.mimeType, ttsResult.sampleRate,
+          events.onAudioStateChange,
+        );
+      } else {
+        events.onAudioStateChange?.("done");
+      }
+
+      resolve();
+    } catch (err) {
+      if (!errorEmitted) {
+        const msg = err instanceof Error ? err.message : String(err);
+        events.onError?.(msg);
+      }
+      reject(err);
+    } finally {
+      activeReader?.cancel().catch(() => { });
+      if (activeSocket && activeSocket.readyState <= WebSocket.OPEN) {
+        activeSocket.close();
+      }
+      activeSocket = null;
+    }
+  });
+
+  return {
+    stop: () => {
+      isStopped = true;
+      if (activeReader) activeReader.cancel().catch(() => { });
+      if (activeSocket && activeSocket.readyState <= WebSocket.OPEN) {
+        activeSocket.close();
+      }
+    },
+    done: donePromise,
+  };
+};
+
+// ── Agent Resume Stream (after page navigation reload) ──────────────
+//
+// When a navigate tool causes a full-page reload, the agent WS is lost.
+// This function opens a new WS with {type: "resume"}, sends the
+// completed tool results (including the navigate result with the new
+// page context), and continues the agent loop from where it left off.
+
+export const agentResumeStream = (
+  baseUrl: string,
+  resumeState: PendingAgentResume,
+  pageContext: string,
+  events: AgentVoiceChatEvents,
+  executeTool: (call: AgentToolCallInfo) => Promise<{ call_id: string; result: string }>,
+): StreamController => {
+  let isStopped = false;
+  let activeSocket: WebSocket | null = null;
+  let activeReader: ReadableStreamDefaultReader<Uint8Array> | undefined;
+  let errorEmitted = false;
+
+  // Build tool results for the calls that were pending when the page reloaded.
+  // Navigate results include the new page context; other tools that couldn't
+  // execute get a descriptive skip message.
+  const allResults = [...resumeState.completedResults];
+  for (const tc of resumeState.pendingToolCalls) {
+    if (allResults.some((r) => r.call_id === tc.call_id)) continue;
+    if (tc.tool === "navigate") {
+      allResults.push({
+        call_id: tc.call_id,
+        result: `Navigasyon tamamlandı. Şu anki sayfa: ${typeof window !== "undefined" ? window.location.href : ""}\nSayfa bağlamı: ${pageContext}`,
+      });
+    } else {
+      allResults.push({
+        call_id: tc.call_id,
+        result: "Sayfa yeniden yüklendi, bu araç çalıştırılamadı.",
+      });
+    }
+  }
+
+  const donePromise = new Promise<void>(async (resolve, reject) => {
+    try {
+      if (isStopped) return resolve();
+
+      let effectiveSessionId = resumeState.sessionId;
+
+      const assistantText = await new Promise<string>((agentResolve, agentReject) => {
+        if (isStopped) { agentResolve(""); return; }
+
+        const wsUrl = toWebSocketUrl(baseUrl, "/chat/agent/ws");
+        const socket = new WebSocket(wsUrl);
+        activeSocket = socket;
+
+        let finalReply = "";
+        let resolved = false;
+
+        const finish = (reply: string) => {
+          if (resolved) return;
+          resolved = true;
+          agentResolve(reply);
+        };
+
+        const fail = (error: Error) => {
+          if (resolved) return;
+          resolved = true;
+          agentReject(error);
+        };
+
+        socket.onopen = () => {
+          console.info("[Bulut] Agent WS resume connected");
+          socket.send(JSON.stringify({
+            type: "resume",
+            project_id: resumeState.projectId,
+            session_id: resumeState.sessionId,
+            model: resumeState.model,
+            page_context: pageContext,
+            accessibility_mode: resumeState.accessibilityMode,
+            pending_tool_calls: resumeState.pendingToolCalls,
+            tool_results: allResults,
+          }));
+        };
+
+        socket.onmessage = async (event) => {
+          let data: Record<string, unknown>;
+          try {
+            data = JSON.parse(String(event.data));
+          } catch { return; }
+
+          const msgType = data.type as string;
+
+          if (msgType === "session" && typeof data.session_id === "string") {
+            effectiveSessionId = data.session_id as string;
+            events.onSessionId?.(effectiveSessionId);
+            return;
+          }
+
+          if (msgType === "iteration") {
+            events.onIteration?.(
+              data.iteration as number,
+              data.max_iterations as number,
+            );
+            return;
+          }
+
+          if (msgType === "reply_delta" && typeof data.delta === "string") {
+            events.onAssistantDelta?.(data.delta);
+            return;
+          }
+
+          if (msgType === "tool_calls" && Array.isArray(data.calls)) {
+            const calls = data.calls as AgentToolCallInfo[];
+            events.onToolCalls?.(calls);
+
+            const results: { call_id: string; result: string }[] = [];
+            for (const call of calls) {
+              const isNavigate = call.tool === "navigate";
+              if (isNavigate) {
+                savePendingAgentResume({
+                  sessionId: effectiveSessionId,
+                  projectId: resumeState.projectId,
+                  model: resumeState.model,
+                  accessibilityMode: resumeState.accessibilityMode,
+                  pendingToolCalls: calls.map((c) => ({
+                    call_id: c.call_id,
+                    tool: c.tool,
+                    args: c.args,
+                  })),
+                  completedResults: [...results],
+                });
+              }
+
+              const result = await executeTool(call);
+
+              if (isNavigate) {
+                clearPendingAgentResume();
+              }
+
+              events.onToolResult?.(call.call_id, call.tool, result.result);
+              results.push(result);
+            }
+
+            if (socket.readyState === WebSocket.OPEN) {
+              socket.send(JSON.stringify({ type: "tool_results", results }));
+            }
+            return;
+          }
+
+          if (msgType === "agent_done") {
+            finalReply = (data.final_reply as string) || "";
+            events.onAssistantDone?.(finalReply);
+            if (typeof data.session_id === "string") {
+              events.onSessionId?.(data.session_id as string);
+            }
+            finish(finalReply);
+            return;
+          }
+
+          if (msgType === "error") {
+            const errMsg = (data.error as string) || "Agent error";
+            errorEmitted = true;
+            events.onError?.(errMsg);
+            fail(new Error(errMsg));
+            return;
+          }
+        };
+
+        socket.onerror = () => {
+          errorEmitted = true;
+          events.onError?.("Agent WebSocket error");
+          fail(new Error("Agent WebSocket error"));
+        };
+
+        socket.onclose = () => finish(finalReply);
+      });
+
+      activeSocket = null;
+
+      // ── TTS ────────────────────────────────────────────────
+      if (isStopped || !assistantText) return resolve();
+
+      console.info(`[Bulut] TTS start mode=resume forced_voice=${FORCED_TTS_VOICE}`);
+      events.onAudioStateChange?.("rendering");
+      let ttsResult: TtsCollectResult;
+
+      try {
+        ttsResult = await collectTtsViaWebSocket(
+          baseUrl, assistantText, Boolean(resumeState.accessibilityMode),
+          () => isStopped,
+          (socket) => { activeSocket = socket; },
+        );
+      } catch (wsError) {
+        if (isStopped) return resolve();
+        console.warn(
+          `[Bulut] TTS WS failed, falling back to SSE: ${wsError instanceof Error ? wsError.message : String(wsError)}`,
+        );
+        ttsResult = await collectTtsViaSse(
+          baseUrl, assistantText, Boolean(resumeState.accessibilityMode),
           () => isStopped,
           (reader) => { activeReader = reader; },
         );

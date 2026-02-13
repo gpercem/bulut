@@ -3,6 +3,7 @@ import type { JSX } from "preact";
 import type { BulutRuntimeConfig } from "../index";
 import {
   agentVoiceChatStream,
+  agentResumeStream,
   type AudioStreamState,
   type StreamController,
   type AgentToolCallInfo,
@@ -10,6 +11,8 @@ import {
 import {
   executeSingleToolCall,
   parseAgentResponse,
+  getPendingAgentResume,
+  clearPendingAgentResume,
   type ToolCallWithId,
 } from "../agent/tools";
 import { getPageContext } from "../agent/context";
@@ -412,6 +415,165 @@ export const ChatWindow = ({
     },
     [],
   );
+
+  // ── Resume agent loop after full-page navigation ────────────────
+  useEffect(() => {
+    const resumeState = getPendingAgentResume();
+    if (!resumeState) return;
+
+    clearPendingAgentResume();
+    console.info("[Bulut] Resuming agent after navigation");
+
+    // Restore session ID from resume state
+    if (resumeState.sessionId) {
+      sessionIdRef.current = resumeState.sessionId;
+      if (typeof localStorage !== "undefined") {
+        localStorage.setItem(SESSION_ID_KEY, resumeState.sessionId);
+      }
+    }
+
+    setIsBusy(true);
+    setIsRunningTools(true);
+    setStatusOverride(STATUS_LABELS.thinking);
+
+    const freshPageContext = getPageContext().summary;
+
+    const resumeToolExec = async (
+      call: AgentToolCallInfo,
+    ): Promise<{ call_id: string; result: string }> => {
+      const toolCall: ToolCallWithId = {
+        tool: call.tool as "navigate" | "getPageContext" | "interact" | "scroll",
+        call_id: call.call_id,
+        ...call.args,
+      } as ToolCallWithId;
+      return executeSingleToolCall(toolCall);
+    };
+
+    const controller = agentResumeStream(
+      config.backendBaseUrl,
+      resumeState,
+      freshPageContext,
+      {
+        onSessionId: (sid) => {
+          if (sid && sid !== sessionIdRef.current) {
+            sessionIdRef.current = sid;
+            if (typeof localStorage !== "undefined") {
+              localStorage.setItem(SESSION_ID_KEY, sid);
+            }
+          }
+        },
+        onAssistantDelta: (delta) => {
+          setIsRunningTools(false);
+          setIsThinking(true);
+          setStatusOverride(null);
+
+          pendingAssistantTextRef.current += delta;
+
+          if (assistantMessageIdRef.current === null) {
+            assistantMessageIdRef.current = appendMessage(
+              pendingAssistantTextRef.current,
+              false,
+            );
+          } else {
+            updateMessageText(
+              assistantMessageIdRef.current,
+              pendingAssistantTextRef.current,
+            );
+          }
+        },
+        onAssistantDone: (assistantText) => {
+          setStatusOverride(null);
+          setIsThinking(false);
+          setIsRenderingAudio(true);
+
+          const finalDisplayText =
+            assistantText || pendingAssistantTextRef.current;
+          pendingAssistantTextRef.current = finalDisplayText;
+
+          if (assistantMessageIdRef.current !== null) {
+            updateMessageText(
+              assistantMessageIdRef.current,
+              finalDisplayText,
+            );
+          } else {
+            assistantMessageIdRef.current = appendMessage(
+              finalDisplayText,
+              false,
+            );
+          }
+        },
+        onToolCalls: (calls) => {
+          setIsRunningTools(true);
+          setStatusOverride(STATUS_LABELS.runningTools);
+
+          for (const call of calls) {
+            const toolLabel =
+              call.tool === "navigate"
+                ? `Sayfaya gidiliyor: ${call.args.url ?? ""}`
+                : call.tool === "getPageContext"
+                  ? "Sayfa bağlamı alınıyor…"
+                  : call.tool === "interact"
+                    ? `Etkileşim: ${call.args.action ?? ""}`
+                    : call.tool === "scroll"
+                      ? "Kaydırılıyor…"
+                      : call.tool;
+
+            appendMessage(`🔧 ${toolLabel}`, false);
+            setMessages((prev) => {
+              const last = prev[prev.length - 1];
+              if (last && !last.isUser) {
+                return [
+                  ...prev.slice(0, -1),
+                  { ...last, type: "tool" as const },
+                ];
+              }
+              return prev;
+            });
+          }
+
+          assistantMessageIdRef.current = null;
+          pendingAssistantTextRef.current = "";
+        },
+        onToolResult: () => {},
+        onIteration: () => {
+          setIsThinking(true);
+          setStatusOverride(STATUS_LABELS.thinking);
+        },
+        onAudioStateChange: handleAudioStateChange,
+        onError: (err) => {
+          setStatusOverride(null);
+          appendMessage(`Hata: ${err}`, false);
+        },
+      },
+      resumeToolExec,
+    );
+
+    activeStreamControllerRef.current = controller;
+
+    controller.done
+      .catch(() => {})
+      .finally(() => {
+        setIsBusy(false);
+        setIsRunningTools(false);
+        setIsThinking(false);
+        setIsRenderingAudio(false);
+        setIsPlayingAudio(false);
+        setStatusOverride(null);
+        pendingAssistantTextRef.current = "";
+        assistantMessageIdRef.current = null;
+        activeStreamControllerRef.current = null;
+
+        if (
+          shouldAutoListenAfterAudio(
+            accessibilityMode,
+            isRecordingRef.current,
+            isBusyRef.current,
+          )
+        ) {
+          void startRecording("vad");
+        }
+      });
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
   const appendMessage = (text: string, isUser: boolean): number => {
     const id = nextMessageIdRef.current++;

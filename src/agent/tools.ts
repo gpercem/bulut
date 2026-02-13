@@ -8,6 +8,61 @@ export const SCROLL_DURATION_MS = 900;
 const CURSOR_EASING = "cubic-bezier(0.4, 0, 0.2, 1)";
 const CURSOR_HOVER_RADIUS_PX = 14;
 
+// ── Pending Agent Resume State (survives page reloads) ──────────────
+
+const RESUME_STORAGE_KEY = "bulut_agent_resume";
+const RESUME_TTL_MS = 60_000; // 1 minute
+
+export interface PendingAgentResume {
+  sessionId: string;
+  projectId: string;
+  model: string;
+  accessibilityMode: boolean;
+  pendingToolCalls: Array<{
+    call_id: string;
+    tool: string;
+    args: Record<string, unknown>;
+  }>;
+  completedResults: Array<{ call_id: string; result: string }>;
+  savedAt: number;
+}
+
+export const savePendingAgentResume = (
+  state: Omit<PendingAgentResume, "savedAt">,
+): void => {
+  if (typeof localStorage === "undefined") return;
+  try {
+    localStorage.setItem(
+      RESUME_STORAGE_KEY,
+      JSON.stringify({ ...state, savedAt: Date.now() }),
+    );
+  } catch {
+    // localStorage may be full or blocked
+  }
+};
+
+export const getPendingAgentResume = (): PendingAgentResume | null => {
+  if (typeof localStorage === "undefined") return null;
+  const raw = localStorage.getItem(RESUME_STORAGE_KEY);
+  if (!raw) return null;
+  try {
+    const parsed = JSON.parse(raw) as PendingAgentResume;
+    if (Date.now() - parsed.savedAt > RESUME_TTL_MS) {
+      clearPendingAgentResume();
+      return null;
+    }
+    return parsed;
+  } catch {
+    clearPendingAgentResume();
+    return null;
+  }
+};
+
+export const clearPendingAgentResume = (): void => {
+  if (typeof localStorage === "undefined") return;
+  localStorage.removeItem(RESUME_STORAGE_KEY);
+};
+
 interface PersistedCursorState {
   url: string;
   x: number;
