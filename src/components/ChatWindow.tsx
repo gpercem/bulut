@@ -28,8 +28,12 @@ import {
 } from "../styles/constants";
 import {
   closeIconContent,
+  completedSfxUrl,
   microphoneIconContent,
+  sentSfxUrl,
+  thinkingSfxUrl,
   restartIconContent,
+  toolCallSfxUrl,
   logoContent,
 } from "../assets";
 import { StreamingJsonParser } from "../utils/streamingJson";
@@ -74,6 +78,15 @@ const STATUS_LABELS = {
   playingAudio: "Ses oynatılıyor",
   runningTools: "Araç çalıştırılıyor",
 } as const;
+
+type SfxName = "sent" | "thinking" | "toolCall" | "completed";
+
+const SFX_SOURCES: Record<SfxName, string> = {
+  sent: sentSfxUrl,
+  thinking: thinkingSfxUrl,
+  toolCall: toolCallSfxUrl,
+  completed: completedSfxUrl,
+};
 
 export const getGreetingText = (agentName: string): string =>
   `Merhaba, ben ${agentName}. Bu web sayfasında neler yapalım?`;
@@ -270,6 +283,11 @@ export const ChatWindow = ({
   const pendingAssistantTextRef = useRef<string>("");
   const streamingJsonParserRef = useRef<StreamingJsonParser | null>(null);
   const awaitingAssistantResponseRef = useRef(false);
+  const sfxQueueRef = useRef<SfxName[]>([]);
+  const sfxQueueActiveRef = useRef(false);
+  const sfxDisposedRef = useRef(false);
+  const activeSfxAudioRef = useRef<HTMLAudioElement | null>(null);
+  const activeSfxResolveRef = useRef<(() => void) | null>(null);
 
   useEffect(() => {
     isBusyRef.current = isBusy;
@@ -278,6 +296,73 @@ export const ChatWindow = ({
   useEffect(() => {
     isRecordingRef.current = isRecording;
   }, [isRecording]);
+
+  const playSfxNow = (name: SfxName): Promise<void> =>
+    new Promise((resolve) => {
+      if (typeof window === "undefined" || sfxDisposedRef.current) {
+        resolve();
+        return;
+      }
+
+      const audio = new Audio(SFX_SOURCES[name]);
+      audio.preload = "auto";
+      activeSfxAudioRef.current = audio;
+
+      let settled = false;
+      const finalize = () => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        audio.onended = null;
+        audio.onerror = null;
+        if (activeSfxAudioRef.current === audio) {
+          activeSfxAudioRef.current = null;
+        }
+        if (activeSfxResolveRef.current === finalize) {
+          activeSfxResolveRef.current = null;
+        }
+        resolve();
+      };
+
+      activeSfxResolveRef.current = finalize;
+      audio.onended = finalize;
+      audio.onerror = finalize;
+
+      void audio.play().catch(() => {
+        // Browser autoplay policies can block short cues.
+        finalize();
+      });
+    });
+
+  const drainSfxQueue = async () => {
+    if (sfxQueueActiveRef.current || sfxDisposedRef.current) {
+      return;
+    }
+
+    sfxQueueActiveRef.current = true;
+    try {
+      while (!sfxDisposedRef.current && sfxQueueRef.current.length > 0) {
+        const next = sfxQueueRef.current.shift();
+        if (!next) {
+          continue;
+        }
+        await playSfxNow(next);
+      }
+    } finally {
+      sfxQueueActiveRef.current = false;
+    }
+  };
+
+  const playSfx = (name: SfxName) => {
+    if (typeof window === "undefined" || sfxDisposedRef.current) {
+      return;
+    }
+    sfxQueueRef.current.push(name);
+    if (!sfxQueueActiveRef.current) {
+      void drainSfxQueue();
+    }
+  };
 
   useEffect(() => {
     if (typeof localStorage !== "undefined") {
@@ -411,6 +496,22 @@ export const ChatWindow = ({
         }
         recorderRef.current = null;
       }
+
+      sfxDisposedRef.current = true;
+      sfxQueueRef.current = [];
+      sfxQueueActiveRef.current = false;
+
+      const activeAudio = activeSfxAudioRef.current;
+      if (activeAudio) {
+        activeAudio.pause();
+        activeAudio.removeAttribute("src");
+        activeAudio.load();
+        activeSfxAudioRef.current = null;
+      }
+
+      const resolveActiveSfx = activeSfxResolveRef.current;
+      activeSfxResolveRef.current = null;
+      resolveActiveSfx?.();
     },
     [],
   );
@@ -481,6 +582,7 @@ export const ChatWindow = ({
           }
         },
         onAssistantDone: (assistantText) => {
+          playSfx("completed");
           setStatusOverride(null);
           setIsThinking(false);
           setIsRenderingAudio(true);
@@ -502,6 +604,9 @@ export const ChatWindow = ({
           }
         },
         onToolCalls: (calls) => {
+          if (calls.length > 0) {
+            playSfx("toolCall");
+          }
           setIsRunningTools(true);
           setStatusOverride(STATUS_LABELS.runningTools);
 
@@ -535,6 +640,7 @@ export const ChatWindow = ({
         },
         onToolResult: () => {},
         onIteration: () => {
+          playSfx("thinking");
           setIsThinking(true);
           setStatusOverride(STATUS_LABELS.thinking);
         },
@@ -685,6 +791,9 @@ export const ChatWindow = ({
           accessibilityMode,
         },
         {
+          onSttRequestSent: () => {
+            playSfx("sent");
+          },
           onTranscription: (data) => {
             if (data.session_id && data.session_id !== sessionIdRef.current) {
               sessionIdRef.current = data.session_id;
@@ -738,6 +847,7 @@ export const ChatWindow = ({
             }
           },
           onAssistantDone: (assistantText) => {
+            playSfx("completed");
             awaitingAssistantResponseRef.current = false;
             setStatusOverride(null);
             setIsThinking(false);
@@ -762,6 +872,9 @@ export const ChatWindow = ({
             }
           },
           onToolCalls: (calls) => {
+            if (calls.length > 0) {
+              playSfx("toolCall");
+            }
             setIsRunningTools(true);
             setStatusOverride(STATUS_LABELS.runningTools);
 
@@ -802,6 +915,7 @@ export const ChatWindow = ({
           },
           onIteration: (_iteration, _maxIterations) => {
             // Agent started a new reasoning iteration
+            playSfx("thinking");
             setIsThinking(true);
             setStatusOverride(STATUS_LABELS.thinking);
           },

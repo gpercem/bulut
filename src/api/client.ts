@@ -277,6 +277,7 @@ const playBufferedAudio = async (
 };
 
 export interface VoiceChatEvents {
+  onSttRequestSent?: () => void;
   onTranscription?: (data: {
     session_id: string;
     user_text: string;
@@ -329,7 +330,8 @@ export async function transcribeAudio(
   file: File,
   projectId: string,
   sessionId: string | null,
-  language: string
+  language: string,
+  onRequestSent?: () => void,
 ): Promise<{ text: string; session_id: string }> {
   const url = `${normalizeBaseUrl(baseUrl)}/chat/stt`;
   const formData = new FormData();
@@ -338,7 +340,9 @@ export async function transcribeAudio(
   if (sessionId) formData.append("session_id", sessionId);
   formData.append("language", language);
 
-  const response = await fetch(url, { method: "POST", body: formData });
+  const responsePromise = fetch(url, { method: "POST", body: formData });
+  onRequestSent?.();
+  const response = await responsePromise;
   if (!response.ok) {
     throw new Error(await parseErrorBody(response));
   }
@@ -615,7 +619,14 @@ export const voiceChatStream = (
     try {
       // 1. STT
       if (isStopped) return resolve();
-      const sttResult = await transcribeAudio(baseUrl, audioFile, projectId, sessionId, "tr");
+      const sttResult = await transcribeAudio(
+        baseUrl,
+        audioFile,
+        projectId,
+        sessionId,
+        "tr",
+        events.onSttRequestSent,
+      );
 
       const currentSessionId = sttResult.session_id;
       const userText = sttResult.text;
@@ -823,7 +834,12 @@ export const agentVoiceChatStream = (
       // ── 1. STT ────────────────────────────────────────────────
       if (isStopped) return resolve();
       const sttResult = await transcribeAudio(
-        baseUrl, audioFile, projectId, sessionId, "tr",
+        baseUrl,
+        audioFile,
+        projectId,
+        sessionId,
+        "tr",
+        events.onSttRequestSent,
       );
 
       const currentSessionId = sttResult.session_id;

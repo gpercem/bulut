@@ -6,6 +6,10 @@ import closeIcon from "./assets/icons/close.svg?inline";
 import closeIconRaw from "./assets/icons/close.svg?raw";
 import bulutLogo from "./assets/icons/bulut_logo.svg";
 import bulutLogoRaw from "./assets/icons/bulut_logo.svg?raw";
+import sentSfx from "./assets/sfx/sent.mp3";
+import thinkingSfx from "./assets/sfx/thinking.mp3";
+import toolCallSfx from "./assets/sfx/tool_call.mp3";
+import completedSfx from "./assets/sfx/completed.mp3";
 
 export const microphoneIconUrl = microphoneIcon;
 export const microphoneIconContent = microphoneIconRaw;
@@ -15,3 +19,7 @@ export const closeIconUrl = closeIcon;
 export const closeIconContent = closeIconRaw;
 export const logoUrl = bulutLogo;
 export const logoContent = bulutLogoRaw;
+export const sentSfxUrl = sentSfx;
+export const thinkingSfxUrl = thinkingSfx;
+export const toolCallSfxUrl = toolCallSfx;
+export const completedSfxUrl = completedSfx;
