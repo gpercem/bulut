@@ -23,6 +23,7 @@ export interface BulutOptions {
   model?: string;
   voice?: BulutVoice;
   baseColor?: string;
+  agentName?: string;
 }
 
 export interface BulutRuntimeConfig {
@@ -31,10 +32,13 @@ export interface BulutRuntimeConfig {
   model: string;
   voice: BulutVoice;
   baseColor: string;
+  agentName: string;
 }
 
 /** Default LLM model — keep in sync with backend config.DEFAULT_LLM_MODEL */
 const DEFAULT_LLM_MODEL = "google/gemini-3-flash-preview:nitro";
+
+const DEFAULT_AGENT_NAME = "Bulut";
 
 const DEFAULT_CONFIG: BulutRuntimeConfig = {
   backendBaseUrl: "https://api.bulut.lu",
@@ -42,6 +46,7 @@ const DEFAULT_CONFIG: BulutRuntimeConfig = {
   model: DEFAULT_LLM_MODEL,
   voice: "zeynep",
   baseColor: COLORS.primary,
+  agentName: DEFAULT_AGENT_NAME,
 };
 
 const isValidHexColor = (value: string): boolean =>
@@ -84,6 +89,26 @@ const applyTheme = (baseColor: string): void => {
   COLORS.messageUser = normalized;
 };
 
+interface RemoteProjectConfig {
+  base_color: string;
+  model: string;
+  agent_name: string;
+}
+
+const fetchRemoteConfig = async (
+  baseUrl: string,
+  projectId: string,
+): Promise<RemoteProjectConfig | null> => {
+  try {
+    const url = baseUrl.replace(/\/+$/, "");
+    const res = await fetch(`${url}/projects/${projectId}/config`);
+    if (!res.ok) return null;
+    return (await res.json()) as RemoteProjectConfig;
+  } catch {
+    return null;
+  }
+};
+
 const resolveRuntimeConfig = (
   options: BulutOptions,
 ): BulutRuntimeConfig => {
@@ -94,6 +119,7 @@ const resolveRuntimeConfig = (
     model: options.model || DEFAULT_CONFIG.model,
     voice,
     baseColor: normalizeHexColor(options.baseColor || DEFAULT_CONFIG.baseColor),
+    agentName: options.agentName || DEFAULT_CONFIG.agentName,
   };
 };
 
@@ -165,6 +191,29 @@ const updateStoredMessage = (id: number, text: string) => {
 };
 
 const BulutWidget = ({ config }: BulutWidgetProps) => {
+  // Live config that merges remote settings over initial config
+  const [liveConfig, setLiveConfig] = useState<BulutRuntimeConfig>(config);
+
+  // Fetch remote project config on mount
+  useEffect(() => {
+    if (!config.projectId) return;
+    let cancelled = false;
+
+    fetchRemoteConfig(config.backendBaseUrl, config.projectId).then((remote) => {
+      if (cancelled || !remote) return;
+      const merged: BulutRuntimeConfig = {
+        ...config,
+        baseColor: normalizeHexColor(remote.base_color || config.baseColor),
+        model: remote.model || config.model,
+        agentName: remote.agent_name || config.agentName,
+      };
+      applyTheme(merged.baseColor);
+      setLiveConfig(merged);
+    });
+
+    return () => { cancelled = true; };
+  }, [config]);
+
   // Check localStorage for persisted state
   const [isOpen, setIsOpen] = useState(() => {
     if (typeof localStorage !== "undefined") {
@@ -245,7 +294,7 @@ const BulutWidget = ({ config }: BulutWidgetProps) => {
   };
 
   const sendAudioAndPreview = async (blob: Blob, mode: boolean) => {
-    if (!config.projectId) return;
+    if (!liveConfig.projectId) return;
     const fileType = blob.type || "audio/webm";
     const ext = fileType.includes("ogg") ? "ogg" : fileType.includes("wav") ? "wav" : "webm";
     const file = new File([blob], `voice.${ext}`, { type: fileType });
@@ -262,12 +311,12 @@ const BulutWidget = ({ config }: BulutWidgetProps) => {
 
     try {
       const controller = voiceChatStream(
-        config.backendBaseUrl,
+        liveConfig.backendBaseUrl,
         file,
-        config.projectId,
+        liveConfig.projectId,
         sessionId,
         {
-          model: config.model,
+          model: liveConfig.model,
           voice: "zeynep",
           pageContext,
           accessibilityMode: mode,
@@ -566,7 +615,7 @@ const BulutWidget = ({ config }: BulutWidgetProps) => {
       {isOpen && (
         <ChatWindow
           onClose={handleClose}
-          config={config}
+          config={liveConfig}
           accessibilityMode={accessibilityMode}
         />
       )}

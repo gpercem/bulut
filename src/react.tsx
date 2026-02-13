@@ -15,6 +15,8 @@ export interface BulutProps {
   voice?: BulutVoice;
   /** Primary theme colour as hex, e.g. `"#6C03C1"`. */
   baseColor?: string;
+  /** Agent display name (max 15 chars). */
+  agentName?: string;
 }
 
 /**
@@ -38,6 +40,7 @@ export function Bulut({
   model,
   voice,
   baseColor,
+  agentName,
 }: BulutProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const containerIdRef = useRef(
@@ -67,6 +70,7 @@ export function Bulut({
         model,
         voice,
         baseColor,
+        agentName,
       });
 
       cleanup = () => mod.destroy();
@@ -76,7 +80,7 @@ export function Bulut({
       destroyed = true;
       cleanup?.();
     };
-  }, [projectId, backendBaseUrl, model, voice, baseColor]);
+  }, [projectId, backendBaseUrl, model, voice, baseColor, agentName]);
 
   // Plain createElement – no JSX – so this file stays free of the
   // Preact JSX transform and keeps real React imports.
