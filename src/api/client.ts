@@ -831,7 +831,57 @@ export interface AgentVoiceChatEvents {
   onIteration?: (iteration: number, maxIterations: number) => void;
   /** Called when the backend confirms / creates a session ID. */
   onSessionId?: (sessionId: string) => void;
+  /**
+   * Called when the agent emits a reply text followed by tool calls.
+   * This text is spoken aloud before the tools run so the user hears
+   * every piece of the conversation, not just the final reply.
+   */
+  onIntermediateReply?: (text: string) => void;
 }
+
+/**
+ * Standalone TTS helper: synthesize + play a text snippet.
+ * Uses WebSocket TTS with SSE fallback, same as the main stream functions.
+ */
+export const speakText = async (
+  baseUrl: string,
+  text: string,
+  voice: string,
+  accessibilityMode: boolean,
+  onAudioStateChange?: (state: AudioStreamState) => void,
+): Promise<void> => {
+  const trimmed = text.trim();
+  if (!trimmed) return;
+
+  console.info(`[Bulut] speakText start (${trimmed.length} chars)`);
+  onAudioStateChange?.("rendering");
+  let ttsResult: TtsCollectResult;
+
+  const neverStopped = () => false;
+
+  try {
+    ttsResult = await collectTtsViaWebSocket(
+      baseUrl, trimmed, voice, accessibilityMode,
+      neverStopped,
+      () => {},
+    );
+  } catch {
+    ttsResult = await collectTtsViaSse(
+      baseUrl, trimmed, voice, accessibilityMode,
+      neverStopped,
+      () => {},
+    );
+  }
+
+  if (ttsResult.chunks.length > 0) {
+    await playBufferedAudio(
+      ttsResult.chunks, ttsResult.mimeType, ttsResult.sampleRate,
+      onAudioStateChange,
+    );
+  } else {
+    onAudioStateChange?.("done");
+  }
+};
 
 // ── Agent Voice Chat Stream (STT → Agent WS → TTS) ─────────────────
 
@@ -888,6 +938,7 @@ export const agentVoiceChatStream = (
 
         let finalReply = "";
         let resolved = false;
+        let accumulatedDelta = "";
 
         const finish = (reply: string) => {
           if (resolved) return;
@@ -940,12 +991,20 @@ export const agentVoiceChatStream = (
           }
 
           if (msgType === "reply_delta" && typeof data.delta === "string") {
+            accumulatedDelta += data.delta;
             events.onAssistantDelta?.(data.delta);
             return;
           }
 
           if (msgType === "tool_calls" && Array.isArray(data.calls)) {
             const calls = data.calls as AgentToolCallInfo[];
+
+            // Speak accumulated text before running tools
+            if (accumulatedDelta.trim()) {
+              events.onIntermediateReply?.(accumulatedDelta.trim());
+            }
+            accumulatedDelta = "";
+
             events.onToolCalls?.(calls);
 
             const results: { call_id: string; result: string }[] = [];
@@ -1136,6 +1195,7 @@ export const agentTextChatStream = (
         let finalReply = "";
         let resolved = false;
         let effectiveSessionId = sessionId || "";
+        let accumulatedDelta = "";
 
         const finish = (reply: string) => {
           if (resolved) return;
@@ -1184,12 +1244,20 @@ export const agentTextChatStream = (
           }
 
           if (msgType === "reply_delta" && typeof data.delta === "string") {
+            accumulatedDelta += data.delta;
             events.onAssistantDelta?.(data.delta);
             return;
           }
 
           if (msgType === "tool_calls" && Array.isArray(data.calls)) {
             const calls = data.calls as AgentToolCallInfo[];
+
+            // Speak accumulated text before running tools
+            if (accumulatedDelta.trim()) {
+              events.onIntermediateReply?.(accumulatedDelta.trim());
+            }
+            accumulatedDelta = "";
+
             events.onToolCalls?.(calls);
 
             const results: { call_id: string; result: string }[] = [];
@@ -1370,6 +1438,7 @@ export const agentResumeStream = (
 
         let finalReply = "";
         let resolved = false;
+        let accumulatedDelta = "";
 
         const finish = (reply: string) => {
           if (resolved) return;
@@ -1420,12 +1489,20 @@ export const agentResumeStream = (
           }
 
           if (msgType === "reply_delta" && typeof data.delta === "string") {
+            accumulatedDelta += data.delta;
             events.onAssistantDelta?.(data.delta);
             return;
           }
 
           if (msgType === "tool_calls" && Array.isArray(data.calls)) {
             const calls = data.calls as AgentToolCallInfo[];
+
+            // Speak accumulated text before running tools
+            if (accumulatedDelta.trim()) {
+              events.onIntermediateReply?.(accumulatedDelta.trim());
+            }
+            accumulatedDelta = "";
+
             events.onToolCalls?.(calls);
 
             const results: { call_id: string; result: string }[] = [];

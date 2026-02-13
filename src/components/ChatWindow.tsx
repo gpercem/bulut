@@ -6,6 +6,7 @@ import {
   agentVoiceChatStream,
   agentResumeStream,
   startSttWebSocketStream,
+  speakText,
   type AudioStreamState,
   type StreamController,
   type AgentToolCallInfo,
@@ -574,6 +575,12 @@ export const ChatWindow = ({
             );
           }
         },
+        onIntermediateReply: (text) => {
+          void speakText(
+            config.backendBaseUrl, text, config.voice,
+            accessibilityMode, handleAudioStateChange,
+          ).catch((err) => console.warn("[Bulut] intermediate TTS failed", err));
+        },
         onToolCalls: (calls) => {
           if (calls.length > 0) {
             playSfx("toolCall");
@@ -857,6 +864,12 @@ export const ChatWindow = ({
               );
             }
           },
+          onIntermediateReply: (text) => {
+            void speakText(
+              config.backendBaseUrl, text, config.voice,
+              accessibilityMode, handleAudioStateChange,
+            ).catch((err) => console.warn("[Bulut] intermediate TTS failed", err));
+          },
           onToolCalls: (calls) => {
             if (calls.length > 0) {
               playSfx("toolCall");
@@ -1065,6 +1078,12 @@ export const ChatWindow = ({
                 false,
               );
             }
+          },
+          onIntermediateReply: (text) => {
+            void speakText(
+              config.backendBaseUrl, text, config.voice,
+              accessibilityMode, handleAudioStateChange,
+            ).catch((err) => console.warn("[Bulut] intermediate TTS failed", err));
           },
           onToolCalls: (calls) => {
             if (calls.length > 0) {
