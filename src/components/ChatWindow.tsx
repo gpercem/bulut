@@ -841,6 +841,15 @@ export const ChatWindow = ({
         });
       }
 
+      // Force-persist messages to localStorage immediately so they
+      // survive a full-page navigate that may happen next frame.
+      if (typeof localStorage !== "undefined") {
+        try {
+          localStorage.setItem(STORAGE_KEY, JSON.stringify(next));
+          localStorage.setItem(TIMESTAMP_KEY, Date.now().toString());
+        } catch { /* ignore full/blocked storage */ }
+      }
+
       return next;
     });
   };

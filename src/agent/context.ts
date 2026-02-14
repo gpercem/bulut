@@ -446,7 +446,22 @@ const getElementLabel = (element: Element): string => {
 
   if (element.tagName.toLowerCase() === "input") {
     const inputType = element.getAttribute("type") || "text";
-    return `${inputType} ${label || "input"}`;
+    const currentValue = element instanceof HTMLInputElement ? element.value : "";
+    const valueNote = currentValue ? ` val="${currentValue.substring(0, 40)}"` : "";
+    return `${inputType} ${label || "input"}${valueNote}`;
+  }
+
+  if (element.tagName.toLowerCase() === "textarea") {
+    const currentValue = element instanceof HTMLTextAreaElement ? element.value : "";
+    const valueNote = currentValue ? ` val="${currentValue.substring(0, 40)}"` : "";
+    return `textarea ${label || "textarea"}${valueNote}`;
+  }
+
+  if (element.tagName.toLowerCase() === "select") {
+    const selectEl = element as HTMLSelectElement;
+    const selectedText = selectEl.selectedOptions?.[0]?.textContent?.trim() || "";
+    const valueNote = selectedText ? ` val="${selectedText}"` : "";
+    return `select ${label || "select"}${valueNote}`;
   }
 
   return label || "untitled";
@@ -569,6 +584,9 @@ const formatSection = (title: string, lines: string[]): string => {
   return `${title}:\n${lines.join("\n")}`;
 };
 
+const COMPACT_THRESHOLD = 10_000;
+const TRUNCATION_LIMIT = 50_000;
+
 const buildOuterHtmlDigest = (): string => {
   const raw = document.body?.outerHTML || document.documentElement.outerHTML;
 
@@ -580,10 +598,21 @@ const buildOuterHtmlDigest = (): string => {
     .replace(/\s+/g, " ")
     .trim();
 
+  // Small pages: keep full content (text between tags preserved)
+  if (withoutScripts.length <= COMPACT_THRESHOLD) {
+    return withoutScripts;
+  }
+
+  // Larger pages: compact to structural skeleton (remove text)
   const structural = withoutScripts
     .replace(/>[^<]*</g, "><")
     .replace(/\s+/g, " ")
     .trim();
+
+  // Hard truncation at limit
+  if (structural.length > TRUNCATION_LIMIT) {
+    return structural.substring(0, TRUNCATION_LIMIT);
+  }
 
   return structural;
 };
@@ -982,7 +1011,14 @@ export const getCachedPageContexts = (): CachedPageContextEntry[] => {
   );
 };
 
-export const getPageContext = (): PageContext => {
+export const invalidateCurrentPageContext = (): void => {
+  if (typeof window === "undefined") return;
+  const url = canonicalUrl(window.location.href);
+  pageContextCache.delete(url);
+  persistCacheToStorage();
+};
+
+export const getPageContext = (forceRefresh: boolean = false): PageContext => {
   if (typeof window === "undefined" || typeof document === "undefined") {
     return {
       links: [],
@@ -993,14 +1029,16 @@ export const getPageContext = (): PageContext => {
 
   hydrateCacheFromStorage();
   const url = canonicalUrl(window.location.href);
-  const cached = pageContextCache.get(url);
-  if (cached) {
-    console.info(`[Autic] context cache hit url=${url}`);
-    return {
-      links: cached.links,
-      interactables: cached.interactables,
-      summary: buildSummaryWithHistory(cached),
-    };
+  if (!forceRefresh) {
+    const cached = pageContextCache.get(url);
+    if (cached) {
+      console.info(`[Autic] context cache hit url=${url}`);
+      return {
+        links: cached.links,
+        interactables: cached.interactables,
+        summary: buildSummaryWithHistory(cached),
+      };
+    }
   }
 
   console.info(`[Autic] context cache miss url=${url}`);

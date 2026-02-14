@@ -7,16 +7,16 @@
  */
 
 /** Maximum number of links to include in the context. */
-export const MAX_LINKS = 20;
+export const MAX_LINKS = 30;
 
 /** Maximum number of interactable elements to include. */
-export const MAX_INTERACTABLES = 24;
+export const MAX_INTERACTABLES = 32;
 
 /** Maximum number of headings (h1-h3) to include. */
-export const MAX_HEADINGS = 10;
+export const MAX_HEADINGS = 12;
 
 /** Maximum number of main-content text snippets. */
-export const MAX_TEXT_SNIPPETS = 4;
+export const MAX_TEXT_SNIPPETS = 8;
 
 /** Maximum number of pages kept in the in-memory context cache. */
 export const MAX_CACHED_PAGES = 20;

@@ -703,6 +703,7 @@ const collectTtsViaWebSocket = async (
   accessibilityMode: boolean,
   isStopped: () => boolean,
   setSocket: (socket: WebSocket | null) => void,
+  onFirstBatchReady?: (batch: TtsCollectResult) => void,
 ): Promise<TtsCollectResult> => {
   const wsUrl = toWebSocketUrl(baseUrl, "/chat/tts/ws");
   const requestId = createRequestId();
@@ -710,6 +711,19 @@ const collectTtsViaWebSocket = async (
   let mimeType = "audio/mpeg";
   let sampleRate = 16000;
   let highestSeqSeen = 0;
+
+  // Streaming: fire first batch of chunks to the caller early
+  let firstBatchFired = false;
+  let firstBatchTimer: ReturnType<typeof setTimeout> | null = null;
+  const FIRST_BATCH_DELAY_MS = 250;
+
+  const fireFirstBatch = () => {
+    if (firstBatchFired || !onFirstBatchReady || chunks.length === 0) return;
+    firstBatchFired = true;
+    if (firstBatchTimer) { clearTimeout(firstBatchTimer); firstBatchTimer = null; }
+    const batch = chunks.splice(0);
+    onFirstBatchReady({ chunks: batch, mimeType, sampleRate });
+  };
 
   const connectOnce = (): Promise<void> =>
     new Promise((resolve, reject) => {
@@ -773,6 +787,12 @@ const collectTtsViaWebSocket = async (
             if (typeof payload.sample_rate === "number") {
               sampleRate = payload.sample_rate;
             }
+
+            // Schedule first-batch flush for streaming playback
+            if (onFirstBatchReady && !firstBatchFired) {
+              if (firstBatchTimer) clearTimeout(firstBatchTimer);
+              firstBatchTimer = setTimeout(fireFirstBatch, FIRST_BATCH_DELAY_MS);
+            }
           } else {
             console.info(
               `[Bulut] TTS WS duplicate chunk ignored request_id=${requestId} seq=${seq} seen=${highestSeqSeen}`,
@@ -792,6 +812,11 @@ const collectTtsViaWebSocket = async (
         }
 
         if (payload.type === "done") {
+          // Flush first batch if not yet fired (short text = all chunks in one batch)
+          if (onFirstBatchReady && !firstBatchFired) {
+            fireFirstBatch();
+          }
+
           const streamLastSeq =
             typeof payload.last_seq === "number" ? payload.last_seq : highestSeqSeen;
           if (streamLastSeq > highestSeqSeen) {
@@ -859,6 +884,94 @@ const collectTtsViaWebSocket = async (
   throw buildError("tts_ws_exhausted", true);
 };
 
+/**
+ * Collect TTS audio via WebSocket (with SSE fallback) and play it.
+ *
+ * Uses streaming playback: the first batch of audio chunks starts
+ * playing immediately while remaining chunks are still being received.
+ * This dramatically reduces perceived latency, especially for longer
+ * text where the backend pipelines synthesis sentence-by-sentence.
+ */
+const collectAndPlayTtsStreamed = async (
+  baseUrl: string,
+  text: string,
+  voice: string,
+  accessibilityMode: boolean,
+  isStopped: () => boolean,
+  setSocket: (socket: WebSocket | null) => void,
+  setReader: (reader: ReadableStreamDefaultReader<Uint8Array> | undefined) => void,
+  onAudioStateChange?: (state: AudioStreamState) => void,
+): Promise<void> => {
+  const trimmed = text.trim();
+  if (!trimmed) { onAudioStateChange?.("done"); return; }
+
+  const playbackGen = getAudioPlaybackGeneration();
+  if (wasPlaybackStoppedAfter(playbackGen)) {
+    onAudioStateChange?.("done");
+    return;
+  }
+
+  onAudioStateChange?.("rendering");
+
+  let firstBatchPlayPromise: Promise<void> | null = null;
+  let ttsResult: TtsCollectResult;
+
+  try {
+    ttsResult = await collectTtsViaWebSocket(
+      baseUrl, trimmed, voice, accessibilityMode,
+      isStopped, setSocket,
+      // Streaming: start playing the first batch immediately
+      (firstBatch) => {
+        if (wasPlaybackStoppedAfter(playbackGen) || isStopped()) return;
+        if (firstBatch.chunks.length === 0) return;
+        firstBatchPlayPromise = playBufferedAudio(
+          firstBatch.chunks, firstBatch.mimeType, firstBatch.sampleRate,
+          (state) => {
+            // Forward playing state, but suppress "done" since more may follow
+            if (state !== "done") onAudioStateChange?.(state);
+          },
+        ).catch(err => console.warn("[Bulut] first batch playback error", err));
+      },
+    );
+  } catch (wsErr) {
+    // If first batch was already playing, accept partial audio
+    if (firstBatchPlayPromise) {
+      await firstBatchPlayPromise;
+      onAudioStateChange?.("done");
+      return;
+    }
+    // Otherwise fall back to SSE (non-streaming, collect-then-play)
+    if (isStopped()) { onAudioStateChange?.("done"); return; }
+    console.warn(
+      `[Bulut] TTS WS failed, falling back to SSE: ${wsErr instanceof Error ? wsErr.message : String(wsErr)}`,
+    );
+    ttsResult = await collectTtsViaSse(
+      baseUrl, trimmed, voice, accessibilityMode,
+      isStopped, setReader,
+    );
+  }
+
+  if (isStopped() || wasPlaybackStoppedAfter(playbackGen)) {
+    onAudioStateChange?.("done");
+    return;
+  }
+
+  // Wait for first batch to finish playing
+  if (firstBatchPlayPromise) {
+    await firstBatchPlayPromise;
+  }
+
+  // Play remaining chunks (if any)
+  if (ttsResult.chunks.length > 0) {
+    await playBufferedAudio(
+      ttsResult.chunks, ttsResult.mimeType, ttsResult.sampleRate,
+      onAudioStateChange,
+    );
+  } else {
+    onAudioStateChange?.("done");
+  }
+};
+
 // ── Agent-mode Types ────────────────────────────────────────────────
 
 export interface AgentToolCallInfo {
@@ -906,41 +1019,14 @@ export const speakText = async (
 ): Promise<void> => {
   const trimmed = text.trim();
   if (!trimmed) return;
-  const playbackGeneration = getAudioPlaybackGeneration();
-
   console.info(`[Bulut] speakText start (${trimmed.length} chars)`);
-  onAudioStateChange?.("rendering");
-  let ttsResult: TtsCollectResult;
-
-  const neverStopped = () => false;
-
-  try {
-    ttsResult = await collectTtsViaWebSocket(
-      baseUrl, trimmed, voice, accessibilityMode,
-      neverStopped,
-      () => {},
-    );
-  } catch {
-    ttsResult = await collectTtsViaSse(
-      baseUrl, trimmed, voice, accessibilityMode,
-      neverStopped,
-      () => {},
-    );
-  }
-
-  if (wasPlaybackStoppedAfter(playbackGeneration)) {
-    onAudioStateChange?.("done");
-    return;
-  }
-
-  if (ttsResult.chunks.length > 0) {
-    await playBufferedAudio(
-      ttsResult.chunks, ttsResult.mimeType, ttsResult.sampleRate,
-      onAudioStateChange,
-    );
-  } else {
-    onAudioStateChange?.("done");
-  }
+  await collectAndPlayTtsStreamed(
+    baseUrl, trimmed, voice, accessibilityMode,
+    () => false,
+    () => {},
+    () => {},
+    onAudioStateChange,
+  );
 };
 
 // ── Agent Voice Chat Stream (STT → Agent WS → TTS) ─────────────────
@@ -999,6 +1085,7 @@ export const agentVoiceChatStream = (
         let finalReply = "";
         let resolved = false;
         let accumulatedDelta = "";
+        let allIntermediateText = "";
 
         const finish = (reply: string) => {
           if (resolved) return;
@@ -1062,6 +1149,7 @@ export const agentVoiceChatStream = (
             // Speak accumulated text before running tools
             if (accumulatedDelta.trim()) {
               events.onIntermediateReply?.(accumulatedDelta.trim());
+              allIntermediateText += accumulatedDelta;
             }
             accumulatedDelta = "";
 
@@ -1084,6 +1172,7 @@ export const agentVoiceChatStream = (
                     args: c.args,
                   })),
                   completedResults: [...results],
+                  accumulatedDelta: allIntermediateText || undefined,
                 });
               }
 
@@ -1154,47 +1243,14 @@ export const agentVoiceChatStream = (
         `[Bulut] TTS start mode=agent voice=${config.voice}`,
       );
 
-      events.onAudioStateChange?.("rendering");
-      let ttsResult: TtsCollectResult;
-
-      try {
-        ttsResult = await collectTtsViaWebSocket(
-          baseUrl,
-          assistantText,
-          config.voice,
-          Boolean(config.accessibilityMode),
-          () => isStopped,
-          (socket) => { activeSocket = socket; },
-        );
-      } catch (wsError) {
-        if (isStopped) return resolve();
-        console.warn(
-          `[Bulut] TTS WS failed, falling back to SSE: ${wsError instanceof Error ? wsError.message : String(wsError)}`,
-        );
-        ttsResult = await collectTtsViaSse(
-          baseUrl,
-          assistantText,
-          config.voice,
-          Boolean(config.accessibilityMode),
-          () => isStopped,
-          (reader) => { activeReader = reader; },
-        );
-      }
-
-      if (!isStopped) {
-        hideAgentCursor();
-      }
-
-      if (!isStopped && ttsResult.chunks.length > 0) {
-        await playBufferedAudio(
-          ttsResult.chunks,
-          ttsResult.mimeType,
-          ttsResult.sampleRate,
-          events.onAudioStateChange,
-        );
-      } else {
-        events.onAudioStateChange?.("done");
-      }
+      hideAgentCursor();
+      await collectAndPlayTtsStreamed(
+        baseUrl, assistantText, config.voice, Boolean(config.accessibilityMode),
+        () => isStopped,
+        (socket) => { activeSocket = socket; },
+        (reader) => { activeReader = reader; },
+        events.onAudioStateChange,
+      );
 
       resolve();
     } catch (err) {
@@ -1265,6 +1321,7 @@ export const agentTextChatStream = (
         let resolved = false;
         let effectiveSessionId = sessionId || "";
         let accumulatedDelta = "";
+        let allIntermediateText = "";
 
         const finish = (reply: string) => {
           if (resolved) return;
@@ -1324,6 +1381,7 @@ export const agentTextChatStream = (
             // Speak accumulated text before running tools
             if (accumulatedDelta.trim()) {
               events.onIntermediateReply?.(accumulatedDelta.trim());
+              allIntermediateText += accumulatedDelta;
             }
             accumulatedDelta = "";
 
@@ -1345,6 +1403,7 @@ export const agentTextChatStream = (
                     args: c.args,
                   })),
                   completedResults: [...results],
+                  accumulatedDelta: allIntermediateText || undefined,
                 });
               }
 
@@ -1405,36 +1464,14 @@ export const agentTextChatStream = (
         return resolve();
       }
 
-      events.onAudioStateChange?.("rendering");
-      let ttsResult: TtsCollectResult;
-
-      try {
-        ttsResult = await collectTtsViaWebSocket(
-          baseUrl, assistantText, config.voice, Boolean(config.accessibilityMode),
-          () => isStopped,
-          (socket) => { activeSocket = socket; },
-        );
-      } catch (wsError) {
-        if (isStopped) return resolve();
-        ttsResult = await collectTtsViaSse(
-          baseUrl, assistantText, config.voice, Boolean(config.accessibilityMode),
-          () => isStopped,
-          (reader) => { activeReader = reader; },
-        );
-      }
-
-      if (!isStopped) {
-        hideAgentCursor();
-      }
-
-      if (!isStopped && ttsResult.chunks.length > 0) {
-        await playBufferedAudio(
-          ttsResult.chunks, ttsResult.mimeType, ttsResult.sampleRate,
-          events.onAudioStateChange,
-        );
-      } else {
-        events.onAudioStateChange?.("done");
-      }
+      hideAgentCursor();
+      await collectAndPlayTtsStreamed(
+        baseUrl, assistantText, config.voice, Boolean(config.accessibilityMode),
+        () => isStopped,
+        (socket) => { activeSocket = socket; },
+        (reader) => { activeReader = reader; },
+        events.onAudioStateChange,
+      );
 
       resolve();
     } catch (err) {
@@ -1519,6 +1556,7 @@ export const agentResumeStream = (
         let finalReply = "";
         let resolved = false;
         let accumulatedDelta = "";
+        let allIntermediateText = "";
 
         const finish = (reply: string) => {
           if (resolved) return;
@@ -1541,6 +1579,7 @@ export const agentResumeStream = (
             model: resumeState.model,
             page_context: pageContext,
             accessibility_mode: resumeState.accessibilityMode,
+            accumulated_delta: resumeState.accumulatedDelta || "",
             pending_tool_calls: resumeState.pendingToolCalls,
             tool_results: allResults,
           }));
@@ -1580,6 +1619,7 @@ export const agentResumeStream = (
             // Speak accumulated text before running tools
             if (accumulatedDelta.trim()) {
               events.onIntermediateReply?.(accumulatedDelta.trim());
+              allIntermediateText += accumulatedDelta;
             }
             accumulatedDelta = "";
 
@@ -1601,6 +1641,7 @@ export const agentResumeStream = (
                     args: c.args,
                   })),
                   completedResults: [...results],
+                  accumulatedDelta: allIntermediateText || undefined,
                 });
               }
 
@@ -1660,39 +1701,14 @@ export const agentResumeStream = (
       }
 
       console.info(`[Bulut] TTS start mode=resume voice=${resumeState.voice}`);
-      events.onAudioStateChange?.("rendering");
-      let ttsResult: TtsCollectResult;
-
-      try {
-        ttsResult = await collectTtsViaWebSocket(
-          baseUrl, assistantText, resumeState.voice, Boolean(resumeState.accessibilityMode),
-          () => isStopped,
-          (socket) => { activeSocket = socket; },
-        );
-      } catch (wsError) {
-        if (isStopped) return resolve();
-        console.warn(
-          `[Bulut] TTS WS failed, falling back to SSE: ${wsError instanceof Error ? wsError.message : String(wsError)}`,
-        );
-        ttsResult = await collectTtsViaSse(
-          baseUrl, assistantText, resumeState.voice, Boolean(resumeState.accessibilityMode),
-          () => isStopped,
-          (reader) => { activeReader = reader; },
-        );
-      }
-
-      if (!isStopped) {
-        hideAgentCursor();
-      }
-
-      if (!isStopped && ttsResult.chunks.length > 0) {
-        await playBufferedAudio(
-          ttsResult.chunks, ttsResult.mimeType, ttsResult.sampleRate,
-          events.onAudioStateChange,
-        );
-      } else {
-        events.onAudioStateChange?.("done");
-      }
+      hideAgentCursor();
+      await collectAndPlayTtsStreamed(
+        baseUrl, assistantText, resumeState.voice, Boolean(resumeState.accessibilityMode),
+        () => isStopped,
+        (socket) => { activeSocket = socket; },
+        (reader) => { activeReader = reader; },
+        events.onAudioStateChange,
+      );
 
       resolve();
     } catch (err) {

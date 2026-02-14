@@ -1,4 +1,4 @@
-import { getPageContext } from "./context";
+import { getPageContext, invalidateCurrentPageContext } from "./context";
 import { COLORS } from "../styles/constants";
 
 const AGENT_CURSOR_ID = "auticbot-agent-cursor";
@@ -11,7 +11,7 @@ const CURSOR_DIAMETER_PX = 25;
 // ── Pending Agent Resume State (survives page reloads) ──────────────
 
 const RESUME_STORAGE_KEY = "bulut_agent_resume";
-const RESUME_TTL_MS = 60_000; // 1 minute
+const RESUME_TTL_MS = 5 * 60_000; // 5 minutes (matches chat history TTL)
 
 export interface PendingAgentResume {
   sessionId: string;
@@ -25,6 +25,7 @@ export interface PendingAgentResume {
     args: Record<string, unknown>;
   }>;
   completedResults: Array<{ call_id: string; result: string }>;
+  accumulatedDelta?: string;
   savedAt: number;
 }
 
@@ -510,11 +511,18 @@ const moveCursor = async (x: number, y: number) => {
     await waitForNextAnimationFrame();
   }
 
-  const startPosition = getAgentWindowTopLeft();
-  setCursorVisibility(cursor, true);
-  setCursorPosition(cursor, startPosition.x, startPosition.y);
-  await new Promise((resolve) => setTimeout(resolve, CURSOR_MOVE_DURATION_MS));
+  const isAlreadyVisible = cursor.style.opacity === "1";
 
+  if (!isAlreadyVisible) {
+    // First appearance: start from agent window top-left
+    const startPosition = getAgentWindowTopLeft();
+    setCursorVisibility(cursor, true);
+    setCursorPosition(cursor, startPosition.x, startPosition.y);
+    await new Promise((resolve) => setTimeout(resolve, CURSOR_MOVE_DURATION_MS));
+  }
+
+  // Animate from current position via CSS transition
+  setCursorVisibility(cursor, true);
   setCursorPosition(cursor, x, y);
   await new Promise((resolve) => setTimeout(resolve, CURSOR_MOVE_DURATION_MS));
 };
@@ -738,15 +746,21 @@ const executeInteract = async (call: InteractToolCall) => {
     dispatchMouseEvent(target.element, "pointerup", target.x, target.y);
     dispatchMouseEvent(target.element, "mouseup", target.x, target.y);
     target.element.click();
+    // Invalidate context cache — page state likely changed after click
+    invalidateCurrentPageContext();
     return;
   }
 
   if (call.action === "type") {
     typeIntoElement(target.element, call.text ?? "");
+    // Invalidate context cache — form state changed
+    invalidateCurrentPageContext();
     return;
   }
 
   submitElement(target.element);
+  // Invalidate context cache — form submission may change page
+  invalidateCurrentPageContext();
 };
 
 const isSamePageNavigation = (targetUrl: string): boolean => {
@@ -1007,7 +1021,7 @@ export const executeSingleToolCall = async (
     }
 
     if (call.tool === "getPageContext") {
-      const context = getPageContext();
+      const context = getPageContext(true);
       return {
         call_id: callId,
         result: context.summary,
