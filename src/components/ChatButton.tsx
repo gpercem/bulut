@@ -7,7 +7,12 @@ import {
   TRANSITIONS,
   BORDER_RADIUS,
 } from "../styles/constants";
-import { MicrophoneIcon, StopIcon, XMarkIcon } from "@heroicons/react/24/outline";
+import {
+  microphoneOutlineIconContent,
+  stopOutlineIconContent,
+  xMarkIconContent,
+} from "../assets";
+import { SvgIcon } from "./SvgIcon";
 
 interface ChatButtonProps {
   onMicClick: () => void;
@@ -84,7 +89,7 @@ export const ChatButton = ({
   };
 
   const showStopButton = isBusy && !isRecording;
-  const MainIcon = showStopButton ? StopIcon : isRecording ? XMarkIcon : MicrophoneIcon;
+  const mainIconSrc = showStopButton ? stopOutlineIconContent : isRecording ? xMarkIconContent : microphoneOutlineIconContent;
 
   const handleClick = () => {
     if (showStopButton) {
@@ -139,7 +144,7 @@ export const ChatButton = ({
           }}
           aria-label="Kapat"
         >
-          <XMarkIcon aria-hidden="true" width={14} height={14} strokeWidth={3} />
+          <SvgIcon src={xMarkIconContent} aria-hidden="true" width={14} height={14} strokeWidth={3} />
         </button>
       )}
 
@@ -256,7 +261,8 @@ export const ChatButton = ({
             }}
             aria-label={showStopButton ? "Görevi durdur" : isRecording ? "Kaydı iptal et" : "Konuşmaya başla"}
           >
-            <MainIcon
+            <SvgIcon
+              src={mainIconSrc}
               aria-hidden="true"
               style={iconStyle}
               strokeWidth={2.25}

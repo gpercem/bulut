@@ -54,9 +54,11 @@ export function SvgIcon({
 
         if (stripColors) {
             // Force inner nodes to use props instead of hardcoded SVG values.
+            const fillValue = fill !== undefined ? fill : "none";
+            const strokeValue = stroke !== undefined ? stroke : "currentColor";
             nextContent = nextContent
-                .replace(/fill="[^"]*"/gi, `fill="${fill}"`)
-                .replace(/stroke="[^"]*"/gi, `stroke="${stroke}"`);
+                .replace(/fill="[^"]*"/gi, `fill="${fillValue}"`)
+                .replace(/stroke="[^"]*"/gi, `stroke="${strokeValue}"`);
         }
 
         if (strokeWidth !== undefined) {

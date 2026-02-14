@@ -33,22 +33,19 @@ import {
 } from "../styles/constants";
 import {
   logoContent,
+  arrowPathIconContent,
+  commandLineIconContent,
+  cursorArrowRaysIconContent,
+  faceSmileIconContent,
+  handRaisedIconContent,
+  mapIconContent,
+  microphoneOutlineIconContent,
+  queueListIconContent,
+  stopOutlineIconContent,
+  xMarkIconContent,
 } from "../assets";
 import { StreamingJsonParser } from "../utils/streamingJson";
 import { playCue, type SfxName } from "../audio/sfxManager";
-import {
-  ArrowPathIcon,
-  CommandLineIcon,
-  CursorArrowRaysIcon,
-  FaceSmileIcon,
-  HandRaisedIcon,
-  MapIcon,
-  MicrophoneIcon,
-  QueueListIcon,
-  StopIcon,
-  XMarkIcon,
-} from "@heroicons/react/24/outline";
-
 import { SvgIcon } from "./SvgIcon";
 
 export interface ChatWindowHandle {
@@ -1880,26 +1877,26 @@ export const ChatWindow = ({
     color: isUser ? COLORS.messageUserText : "hsla(215, 100%, 5%, 1)",
   });
 
-  const resolveToolIcon = (kind: Message["toolKind"]) => {
+  const resolveToolIconSrc = (kind: Message["toolKind"]): string => {
     if (kind === "cursor") {
-      return CursorArrowRaysIcon;
+      return cursorArrowRaysIconContent;
     }
     if (kind === "scroll") {
-      return HandRaisedIcon;
+      return handRaisedIconContent;
     }
     if (kind === "navigate") {
-      return MapIcon;
+      return mapIconContent;
     }
     if (kind === "form") {
-      return QueueListIcon;
+      return queueListIconContent;
     }
     if (kind === "interact") {
-      return HandRaisedIcon;
+      return handRaisedIconContent;
     }
     if (kind === "unknown") {
-      return CommandLineIcon;
+      return commandLineIconContent;
     }
-    return FaceSmileIcon;
+    return faceSmileIconContent;
   };
 
   const footerStyle: { [key: string]: string } = {
@@ -2042,7 +2039,7 @@ export const ChatWindow = ({
             aria-label="Sohbeti yeniden başlat"
             title="Sohbeti yeniden başlat"
           >
-            <ArrowPathIcon aria-hidden="true" width={22} height={22} />
+            <SvgIcon src={arrowPathIconContent} aria-hidden="true" width={22} height={22} />
           </button>
 
           <button
@@ -2058,7 +2055,7 @@ export const ChatWindow = ({
             aria-label="Sohbeti kapat"
             title="Sohbeti kapat"
           >
-            <XMarkIcon aria-hidden="true" width={22} height={22} />
+            <SvgIcon src={xMarkIconContent} aria-hidden="true" width={22} height={22} />
           </button>
         </div>
       </div>
@@ -2067,7 +2064,7 @@ export const ChatWindow = ({
         <div style={messagesListStyle} ref={messagesContentRef}>
           {messages.map((message) => {
             if (message.type === "tool") {
-              const ToolIcon = resolveToolIcon(message.toolKind);
+              const toolIconSrc = resolveToolIconSrc(message.toolKind);
               return (
                 <div
                   key={message.id}
@@ -2079,11 +2076,12 @@ export const ChatWindow = ({
                     gap: "8px",
                   }}
                 >
-                  <ToolIcon
+                  <SvgIcon
+                    src={toolIconSrc}
                     aria-hidden="true"
                     width={20}
                     height={20}
-                    style={{ flexShrink: "0" }}
+                    style={{ flexShrink: 0 }}
                   />
                   <span>{message.text}</span>
                 </div>
@@ -2180,7 +2178,8 @@ export const ChatWindow = ({
               aria-label="Görevi durdur"
               title="Görevi durdur"
             >
-              <StopIcon
+              <SvgIcon
+                src={stopOutlineIconContent}
                 aria-hidden="true"
                 width={22}
                 height={22}
@@ -2206,14 +2205,16 @@ export const ChatWindow = ({
               }
             >
               {isVadRecording ? (
-                <XMarkIcon
+                <SvgIcon
+                  src={xMarkIconContent}
                   aria-hidden="true"
                   width={22}
                   height={22}
                   style={{ color: "hsla(215, 100%, 5%, 1)" }}
                 />
               ) : (
-                <MicrophoneIcon
+                <SvgIcon
+                  src={microphoneOutlineIconContent}
                   aria-hidden="true"
                   width={22}
                   height={22}
