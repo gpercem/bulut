@@ -97,13 +97,14 @@ export const HOLD_THRESHOLD_MS = 250;
 
 const STATUS_LABELS = {
   ready: "Hazır",
-  loading: "Yükleniyor",
-  listening: "Dinliyor",
+  loading: "Bir saniye",
+  micInitializing: "Bir saniye",
+  listening: "Sizi dinliyorum",
   accessibilityActive: "Erişilebilirlik Aktif",
-  transcribing: "Metne dönüştürülüyor",
-  thinking: "Düşünüyor",
-  playingAudio: "Ses oynatılıyor",
-  runningTools: "Araç çalıştırılıyor",
+  transcribing: "Düşünüyorum",
+  thinking: "Düşünüyorum",
+  playingAudio: "",
+  runningTools: "Siteyle ilgileniyorum",
 } as const;
 
 export const getGreetingText = (agentName: string): string =>
@@ -1411,11 +1412,7 @@ export const ChatWindow = ({
       return;
     }
 
-    setStatusOverride(
-      accessibilityMode && mode === "vad"
-        ? STATUS_LABELS.accessibilityActive
-        : STATUS_LABELS.listening,
-    );
+    setStatusOverride(STATUS_LABELS.micInitializing);
 
     if (!navigator.mediaDevices?.getUserMedia) {
       setStatusOverride(null);
@@ -1586,6 +1583,12 @@ export const ChatWindow = ({
       setIsRecording(true);
       isRecordingRef.current = true;
       startRecordingTimer();
+
+      setStatusOverride(
+        accessibilityMode && mode === "vad"
+          ? STATUS_LABELS.accessibilityActive
+          : STATUS_LABELS.listening,
+      );
 
       if (pendingStopAfterStartRef.current) {
         pendingStopAfterStartRef.current = false;
