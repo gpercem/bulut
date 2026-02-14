@@ -81,12 +81,14 @@ const SESSION_ID_KEY = "bulut_session_id";
 const TTL_MS = 5 * 60 * 1000;
 const VAD_THRESHOLD = 0.06;
 const SILENCE_DURATION_MS = 500;
+const ACCESSIBILITY_MIN_SPEECH_DURATION_MS = 1500;
 export const HOLD_THRESHOLD_MS = 250;
 
 const STATUS_LABELS = {
   ready: "Hazır",
   loading: "Yükleniyor",
   listening: "Dinliyor",
+  accessibilityActive: "erişilebilirlik aktif",
   transcribing: "Metne dönüştürülüyor",
   thinking: "Düşünüyor",
   playingAudio: "Ses oynatılıyor",
@@ -205,6 +207,12 @@ export const shouldAutoListenAfterAudio = (
   isRecording: boolean,
   isBusy: boolean,
 ): boolean => accessibilityMode && !isRecording && !isBusy;
+
+export const shouldAcceptVadSpeech = (
+  speechDurationMs: number,
+  enforceMinSpeechDuration: boolean,
+  minSpeechDurationMs: number = ACCESSIBILITY_MIN_SPEECH_DURATION_MS,
+): boolean => !enforceMinSpeechDuration || speechDurationMs >= minSpeechDurationMs;
 
 export const ChatWindow = ({
   onClose,
@@ -333,7 +341,7 @@ export const ChatWindow = ({
   useEffect(() => {
     if (!onPreviewChange) return;
     if (isRecording) {
-      onPreviewChange(STATUS_LABELS.listening);
+      onPreviewChange(statusOverride ?? STATUS_LABELS.listening);
       return;
     }
     // When audio is rendering/playing, show the actual message text
@@ -1296,6 +1304,8 @@ export const ChatWindow = ({
     const dataArray = new Uint8Array(analyser.frequencyBinCount);
     silenceStartRef.current = null;
     let speechDetected = false;
+    let speechStartedAt: number | null = null;
+    const enforceMinSpeechDuration = accessibilityMode;
 
     vadIntervalRef.current = window.setInterval(() => {
       if (!isRecordingRef.current || recorder.state === "inactive") {
@@ -1313,6 +1323,12 @@ export const ChatWindow = ({
       const volume = average / 255;
 
       if (volume < VAD_THRESHOLD) {
+        if (!speechDetected) {
+          speechStartedAt = null;
+          silenceStartRef.current = null;
+          return;
+        }
+
         if (silenceStartRef.current === null) {
           silenceStartRef.current = Date.now();
           return;
@@ -1325,8 +1341,20 @@ export const ChatWindow = ({
         return;
       }
 
-      speechDetected = true;
       silenceStartRef.current = null;
+      if (speechStartedAt === null) {
+        speechStartedAt = Date.now();
+      }
+
+      if (!speechDetected) {
+        const speechDuration = Date.now() - speechStartedAt;
+        if (shouldAcceptVadSpeech(speechDuration, enforceMinSpeechDuration)) {
+          speechDetected = true;
+          if (enforceMinSpeechDuration) {
+            setStatusOverride(STATUS_LABELS.listening);
+          }
+        }
+      }
     }, 50);
   };
 
@@ -1339,7 +1367,11 @@ export const ChatWindow = ({
       return;
     }
 
-    setStatusOverride(STATUS_LABELS.listening);
+    setStatusOverride(
+      accessibilityMode && mode === "vad"
+        ? STATUS_LABELS.accessibilityActive
+        : STATUS_LABELS.listening,
+    );
 
     if (!navigator.mediaDevices?.getUserMedia) {
       setStatusOverride(null);
@@ -1726,7 +1758,9 @@ export const ChatWindow = ({
     overflow: "hidden",
     zIndex: "10000",
     animation: hidden ? "none" : `slideIn ${TRANSITIONS.medium}`,
-    boxShadow: SHADOW,
+    boxShadow: accessibilityMode
+      ? `inset 0 0 0 1px ${COLORS.primary}, ${SHADOW}`
+      : SHADOW,
     fontFamily: "\"Geist\", sans-serif",
   };
 

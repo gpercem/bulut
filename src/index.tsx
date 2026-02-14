@@ -274,6 +274,7 @@ const BulutWidget = ({ config }: BulutWidgetProps) => {
           onStopTask={() => chatActionsRef.current?.stopTask()}
           isRecording={isRecording}
           isBusy={isBusy}
+          accessibilityMode={isAccessibilityEnabled}
           showBubble={showBubble}
           onBubbleClick={() => {
             setShowBubble(false);
