@@ -5,9 +5,11 @@ import {
   classifyMicGesture,
   clearPersistedChatState,
   createInitialMessages,
+  hasActiveStatus,
   resolveStatusText,
   resolveAssistantPayload,
   shouldAutoListenAfterAudio,
+  shouldAcceptVadSpeech,
   scrollElementToBottom,
 } from "./ChatWindow";
 
@@ -122,5 +124,26 @@ describe("status and timer helpers", () => {
     expect(shouldAutoListenAfterAudio(false, false, false)).toBe(false);
     expect(shouldAutoListenAfterAudio(true, true, false)).toBe(false);
     expect(shouldAutoListenAfterAudio(true, false, true)).toBe(false);
+  });
+
+  it("requires 1.5 second persistent speech only in accessibility mode", () => {
+    expect(shouldAcceptVadSpeech(1499, true)).toBe(false);
+    expect(shouldAcceptVadSpeech(1500, true)).toBe(true);
+    expect(shouldAcceptVadSpeech(100, false)).toBe(true);
+  });
+
+  it("shows accessibility toggle only when no active status remains", () => {
+    const idleFlags = {
+      isBusy: false,
+      isRecording: false,
+      isTranscribing: false,
+      isThinking: false,
+      isRenderingAudio: false,
+      isPlayingAudio: false,
+      isRunningTools: false,
+    };
+
+    expect(hasActiveStatus(idleFlags, null)).toBe(false);
+    expect(hasActiveStatus(idleFlags, "Araç çalıştırılıyor")).toBe(true);
   });
 });

@@ -17,6 +17,7 @@ interface ChatButtonProps {
   onStopTask: () => void;
   isRecording: boolean;
   isBusy: boolean;
+  accessibilityMode?: boolean;
   showBubble: boolean;
   onBubbleClick: () => void;
   previewMessage: string | null;
@@ -30,6 +31,7 @@ export const ChatButton = ({
   onStopTask,
   isRecording,
   isBusy,
+  accessibilityMode = false,
   showBubble,
   onBubbleClick,
   previewMessage,
@@ -37,6 +39,9 @@ export const ChatButton = ({
   onPreviewClose,
 }: ChatButtonProps) => {
   const bgColor = COLORS.primary;
+  const popupBoxShadow = accessibilityMode
+    ? `inset 0 0 0 1px ${COLORS.primary}, ${SHADOW}`
+    : SHADOW;
 
   const containerStyle: { [key: string]: string } = {
     position: "fixed",
@@ -172,7 +177,7 @@ export const ChatButton = ({
           line-height: 1.4;
           position: relative;
           overflow: visible;
-          box-shadow: ${SHADOW};
+          box-shadow: ${popupBoxShadow};
         }
         .bulut-popup-bubble {
           animation: bulut-bubbleIn 400ms ease-out;
