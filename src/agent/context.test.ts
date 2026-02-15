@@ -5,32 +5,7 @@ import {
   buildPageContextSummary,
   clearPageContextCache,
   getCachedPageContexts,
-  type PageContextSummaryInput,
 } from "./context";
-
-const buildInput = (): PageContextSummaryInput => ({
-  url: "https://example.com/products?page=2",
-  title: "Example Products",
-  lang: "tr",
-  headings: ["- Urunler", "- One Cikanlar"],
-  landmarks: ["- main: 1", "- nav: 2", "- button: 14"],
-  interactionSignals: [
-    "- coverage: semantic=8, non-semantic=6, contenteditable=1",
-    "- listener hints: click*4, keydown*2",
-  ],
-  styleSelectors: [".hero button:hover", "[role='button']:focus"],
-  pageBlueprint: [
-    "- nodes: total=120, scanned=120, visible=84, max-depth=9",
-    "- branch digest: main#app>section.hero+section.features || nav.topbar>a+a+a",
-  ],
-  links: ["- Sepet -> https://example.com/cart"],
-  interactables: [
-    "- button #checkout (Odeme Yap)",
-    "- input input[name=\"q\"] (text ara)",
-  ],
-  textSnippets: ["- Haftanin en cok satilan urunlerini burada bulabilirsiniz."],
-  outerHtmlDigest: "<body><main><section><h1>Urunler</h1></section></main></body>",
-});
 
 describe("buildPageContextSummary", () => {
   beforeEach(() => {
@@ -61,27 +36,37 @@ describe("buildPageContextSummary", () => {
   });
 
   it("includes all expected sections", () => {
-    const summary = buildPageContextSummary(buildInput());
+    const summary = buildPageContextSummary(
+      "https://example.com/products?page=2",
+      "Example Products",
+      "tr",
+      ["- Urunler", "- One Cikanlar"],
+      ["- Sepet -> https://example.com/cart"],
+      ['- [1] Button: "Odeme Yap"', '- [2] Input: "ara" (text)'],
+      ["- Haftanin en cok satilan urunlerini burada bulabilirsiniz."],
+    );
 
-    expect(summary).toContain("Meta:");
+    expect(summary).toContain("Page:");
     expect(summary).toContain("Headings:");
-    expect(summary).toContain("Landmark Snapshot:");
-    expect(summary).toContain("Interaction Signals:");
-    expect(summary).toContain("Stylesheet Selector Snapshot:");
-    expect(summary).toContain("Compressed Page Blueprint:");
-    expect(summary).toContain("Top Links:");
-    expect(summary).toContain("Top Interactables:");
-    expect(summary).toContain("Main Content Snippets:");
-    expect(summary).toContain("OuterHTML Skeleton:");
+    expect(summary).toContain("Content Snippets:");
+    expect(summary).toContain("Links:");
+    expect(summary).toContain("Interactive Elements:");
   });
 
-  it("does not truncate oversized summaries", () => {
-    const oversized = buildInput();
-    oversized.outerHtmlDigest = "x".repeat(12_000);
+  it("shows 'none' for empty sections", () => {
+    const summary = buildPageContextSummary(
+      "https://example.com",
+      "Example",
+      "tr",
+      [],
+      [],
+      [],
+      [],
+    );
 
-    const summary = buildPageContextSummary(oversized);
-    expect(summary.length).toBeGreaterThan(12_000);
-    expect(summary).not.toContain("...[truncated]");
+    expect(summary).toContain("Headings:\n- none");
+    expect(summary).toContain("Links:\n- none");
+    expect(summary).toContain("Interactive Elements:\n- none");
   });
 
   it("restores page context entries from session storage cache", () => {

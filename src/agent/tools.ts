@@ -1,4 +1,4 @@
-import { getPageContext, invalidateCurrentPageContext } from "./context";
+import { getPageContext, getElementById, invalidateCurrentPageContext } from "./context";
 import { COLORS } from "../styles/constants";
 
 const AGENT_CURSOR_ID = "auticbot-agent-cursor";
@@ -70,6 +70,7 @@ type InteractAction = "move" | "click" | "type" | "submit";
 interface InteractToolCall {
   tool: "interact";
   action: InteractAction;
+  id?: number;
   selector?: string;
   text?: string;
   x?: number;
@@ -87,7 +88,8 @@ interface GetPageContextToolCall {
 
 interface ScrollToolCall {
   tool: "scroll";
-  selector: string;
+  id?: number;
+  selector?: string;
 }
 
 export type AgentToolCall =
@@ -212,6 +214,7 @@ const sanitizeToolCalls = (value: unknown): AgentToolCall[] => {
       toolCalls.push({
         tool: "interact",
         action,
+        id: asNumber(item.id),
         selector: asString(item.selector),
         text: typeof item.text === "string" ? item.text : undefined,
         x: asNumber(item.x),
@@ -241,13 +244,15 @@ const sanitizeToolCalls = (value: unknown): AgentToolCall[] => {
     }
 
     if (item.tool === "scroll") {
+      const id = asNumber(item.id);
       const selector = asString(item.selector);
-      if (!selector) {
+      if (!id && !selector) {
         continue;
       }
 
       toolCalls.push({
         tool: "scroll",
+        id,
         selector,
       });
     }
@@ -570,6 +575,17 @@ const findElementBySelector = (selector: string): Element | null => {
 };
 
 const resolveTarget = (call: InteractToolCall): ResolvedTarget | null => {
+  // 1. Try resolving by semantic ID from the element map
+  if (typeof call.id === "number") {
+    const mapped = getElementById(call.id);
+    if (mapped instanceof HTMLElement) {
+      const center = getElementCenter(mapped);
+      return { element: mapped, x: center.x, y: center.y };
+    }
+    console.warn(`AuticBot interact: element id=${call.id} not found in map`);
+  }
+
+  // 2. Fallback to CSS selector
   if (call.selector) {
     const selected = findElementBySelector(call.selector);
 
@@ -591,7 +607,7 @@ const resolveTarget = (call: InteractToolCall): ResolvedTarget | null => {
     };
   }
 
-  console.warn("AuticBot interact: missing target selector or coordinates.", call);
+  console.warn("AuticBot interact: missing target id, selector or coordinates.", call);
   return null;
 };
 
@@ -705,9 +721,12 @@ const slowScrollElementIntoViewWithMode = async (
 };
 
 const executeScroll = async (call: ScrollToolCall) => {
-  const selected = findElementBySelector(call.selector);
+  const selected =
+    (typeof call.id === "number" ? getElementById(call.id) : null) ??
+    (call.selector ? findElementBySelector(call.selector) : null);
+
   if (!(selected instanceof HTMLElement)) {
-    console.warn(`AuticBot scroll: selector not found: ${call.selector}`);
+    console.warn(`AuticBot scroll: target not found (id=${call.id}, selector=${call.selector})`);
     return;
   }
 

@@ -2,6 +2,7 @@ export interface PageContext {
   links: string[];
   interactables: string[];
   summary: string;
+  elementMap: Map<number, Element>;
 }
 
 export interface CachedPageContextEntry {
@@ -13,33 +14,12 @@ export interface CachedPageContextEntry {
   version: number;
 }
 
-export interface PageContextSummaryInput {
-  url: string;
-  title: string;
-  lang: string;
-  headings: string[];
-  landmarks: string[];
-  links: string[];
-  interactables: string[];
-  interactionSignals: string[];
-  styleSelectors: string[];
-  pageBlueprint: string[];
-  textSnippets: string[];
-  outerHtmlDigest: string;
-}
-
 interface InteractableCandidate {
+  id: number;
   line: string;
   score: number;
   order: number;
-}
-
-interface PageSignalSnapshot {
-  links: string[];
-  interactables: string[];
-  interactionSignals: string[];
-  styleSelectors: string[];
-  pageBlueprint: string[];
+  element: Element;
 }
 
 import {
@@ -49,15 +29,10 @@ import {
   MAX_TEXT_SNIPPETS,
   MAX_CACHED_PAGES,
   MAX_PAGE_SCAN_ELEMENTS,
-  MAX_EVENT_HINTS_PER_ELEMENT,
-  MAX_BRANCH_SAMPLES,
-  MAX_BRANCH_DEPTH,
-  MAX_STYLESHEET_SELECTORS,
-  MAX_STYLESHEET_RULES,
 } from "./contextConfig";
 
-export const PAGE_CONTEXT_CACHE_VERSION = 3;
-export const PAGE_CONTEXT_CACHE_KEY = "auticbot_page_context_cache_v3";
+export const PAGE_CONTEXT_CACHE_VERSION = 4;
+export const PAGE_CONTEXT_CACHE_KEY = "auticbot_page_context_cache_v4";
 
 const NON_CONTENT_TAGS = new Set([
   "script",
@@ -66,6 +41,28 @@ const NON_CONTENT_TAGS = new Set([
   "template",
   "link",
   "meta",
+]);
+
+/** SVG drawing primitives — never useful as standalone interactables. */
+const SVG_INTERNAL_TAGS = new Set([
+  "path",
+  "circle",
+  "line",
+  "rect",
+  "polygon",
+  "polyline",
+  "ellipse",
+  "g",
+  "use",
+  "defs",
+  "clippath",
+  "mask",
+  "symbol",
+  "lineargradient",
+  "radialgradient",
+  "stop",
+  "text",
+  "tspan",
 ]);
 
 const NATIVE_INTERACTIVE_TAGS = new Set([
@@ -96,58 +93,18 @@ const INTERACTIVE_ROLES = new Set([
   "treeitem",
 ]);
 
-const TRACKED_DISPLAY_VALUES = new Set([
-  "block",
-  "inline",
-  "inline-block",
-  "flex",
-  "inline-flex",
-  "grid",
-  "inline-grid",
-]);
-
-const TRACKED_POSITION_VALUES = new Set([
-  "relative",
-  "absolute",
-  "fixed",
-  "sticky",
-]);
-
-const EVENT_HINT_NAMES = [
-  "click",
-  "dblclick",
-  "mousedown",
-  "mouseup",
-  "pointerdown",
-  "pointerup",
-  "touchstart",
-  "touchend",
-  "keydown",
-  "keyup",
-  "keypress",
-  "input",
-  "change",
-  "submit",
-  "focus",
-  "blur",
-];
-
-const ARIA_INTERACTION_ATTRS = [
-  "aria-controls",
-  "aria-expanded",
-  "aria-haspopup",
-  "aria-pressed",
-  "aria-selected",
-];
-
-const DATA_INTERACTION_PATTERN =
-  /(action|click|press|toggle|target|trigger|nav|open|close|menu|modal|command|submit)/i;
-
-const STYLESHEET_SELECTOR_PATTERN =
-  /(:hover|:focus|:active|button|a\b|input|textarea|select|\[role=|\[aria-|\[data-|\.btn|\.link)/i;
-
 const pageContextCache = new Map<string, CachedPageContextEntry>();
 let cacheHydrated = false;
+
+/**
+ * Live element map — maps numeric IDs to DOM elements.
+ * Rebuilt on every page context scan; NOT serialised to cache.
+ */
+let liveElementMap = new Map<number, Element>();
+
+/** Look up a DOM element by its semantic-map ID. */
+export const getElementById = (id: number): Element | undefined =>
+  liveElementMap.get(id);
 
 const normalizeWhitespace = (value: string): string =>
   value.replace(/\s+/g, " ").trim();
@@ -176,25 +133,6 @@ const isCacheEntry = (value: unknown): value is CachedPageContextEntry => {
   );
 };
 
-const bumpCount = (map: Map<string, number>, key: string): void => {
-  if (!key) {
-    return;
-  }
-  map.set(key, (map.get(key) ?? 0) + 1);
-};
-
-const formatTopCounts = (map: Map<string, number>, maxItems: number): string => {
-  if (map.size === 0) {
-    return "none";
-  }
-
-  return Array.from(map.entries())
-    .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
-    .slice(0, maxItems)
-    .map(([name, count]) => `${name}*${count}`)
-    .join(", ");
-};
-
 const parseTabIndex = (value: string | null): number | null => {
   if (value === null) {
     return null;
@@ -202,24 +140,6 @@ const parseTabIndex = (value: string | null): number | null => {
 
   const parsed = Number.parseInt(value, 10);
   return Number.isNaN(parsed) ? null : parsed;
-};
-
-const compactToken = (value: string): string => {
-  const compact = value.replace(/\s+/g, "-").replace(/[^a-zA-Z0-9_-]/g, "");
-  return compact || "";
-};
-
-const getElementDepth = (element: Element): number => {
-  let depth = 0;
-  let cursor: Element | null = element;
-  while (cursor?.parentElement) {
-    depth += 1;
-    cursor = cursor.parentElement;
-    if (cursor === document.body) {
-      break;
-    }
-  }
-  return depth;
 };
 
 const getPrimaryRole = (element: Element): string => {
@@ -338,6 +258,23 @@ const isVisible = (element: Element): boolean => {
   return rect.width > 0 && rect.height > 0;
 };
 
+/**
+ * Returns true if the element is nested inside an interactive parent
+ * (e.g. a `<span>` or `<img>` inside a `<button>` or `<a>`).
+ * This prevents listing child fragments of an already-listed interactable.
+ */
+const hasInteractiveAncestor = (element: Element): boolean => {
+  let parent = element.parentElement;
+  while (parent && parent !== document.body) {
+    const parentTag = parent.tagName.toLowerCase();
+    if (NATIVE_INTERACTIVE_TAGS.has(parentTag)) return true;
+    const parentRole = getPrimaryRole(parent);
+    if (INTERACTIVE_ROLES.has(parentRole)) return true;
+    parent = parent.parentElement;
+  }
+  return false;
+};
+
 const toAbsoluteUrl = (href: string): string => {
   try {
     return new URL(href, window.location.href).href;
@@ -346,80 +283,11 @@ const toAbsoluteUrl = (href: string): string => {
   }
 };
 
-const escapeCssValue = (value: string): string => {
-  if (typeof CSS !== "undefined" && typeof CSS.escape === "function") {
-    return CSS.escape(value);
-  }
-
-  return value.replace(/([ #;&,.+*~':"!^$\[\]()=>|\/@])/g, "\\$1");
-};
-
-const buildSelectorSegment = (element: Element): string => {
-  const tag = element.tagName.toLowerCase();
-
-  if (element.id) {
-    return `#${escapeCssValue(element.id)}`;
-  }
-
-  const attrCandidates: Array<[name: string, value: string | null]> = [
-    ["name", element.getAttribute("name")],
-    ["data-testid", element.getAttribute("data-testid")],
-    ["data-test-id", element.getAttribute("data-test-id")],
-    ["aria-label", element.getAttribute("aria-label")],
-    ["role", element.getAttribute("role")],
-    ["type", element.getAttribute("type")],
-  ];
-
-  for (const [attrName, attrValue] of attrCandidates) {
-    if (attrValue) {
-      return `${tag}[${attrName}="${escapeCssValue(attrValue)}"]`;
-    }
-  }
-
-  const classes = Array.from(element.classList)
-    .filter(Boolean)
-    .slice(0, 3)
-    .map((className) => `.${escapeCssValue(className)}`)
-    .join("");
-  if (classes) {
-    return `${tag}${classes}`;
-  }
-
-  const parent = element.parentElement;
-  if (!parent) {
-    return tag;
-  }
-
-  const siblingsOfTag = Array.from(parent.children).filter(
-    (sibling) => sibling.tagName === element.tagName,
-  );
-  const index = siblingsOfTag.indexOf(element) + 1;
-  return `${tag}:nth-of-type(${index})`;
-};
-
-const buildSelector = (element: Element): string => {
-  const segments: string[] = [];
-  let cursor: Element | null = element;
-  let depth = 0;
-
-  while (cursor && depth < 4) {
-    const segment = buildSelectorSegment(cursor);
-    segments.unshift(segment);
-    if (segment.startsWith("#")) {
-      break;
-    }
-    cursor = cursor.parentElement;
-    depth += 1;
-  }
-
-  return segments.join(" > ");
-};
-
 const getElementLabel = (element: Element): string => {
   const text = normalizeWhitespace(
     (element instanceof HTMLElement ? element.innerText : element.textContent) ||
       "",
-  );
+  ).substring(0, 80);
   const ariaLabel = normalizeWhitespace(element.getAttribute("aria-label") || "");
   const title = normalizeWhitespace(element.getAttribute("title") || "");
   const placeholder = normalizeWhitespace(
@@ -433,188 +301,225 @@ const getElementLabel = (element: Element): string => {
       ? normalizeWhitespace(element.value || "")
       : "";
 
-  const classHint = Array.from(element.classList)
-    .map((item) => compactToken(item))
-    .find(Boolean);
-  const fallback =
-    (element.id && `#${element.id}`) ||
-    (classHint && `.${classHint}`) ||
-    buildSelector(element);
-
   const label =
-    text || ariaLabel || title || placeholder || value || name || fallback;
+    text || ariaLabel || title || placeholder || value || name || "";
 
-  if (element.tagName.toLowerCase() === "input") {
+  const tag = element.tagName.toLowerCase();
+
+  // Images: prefer alt text, fall back to src filename
+  if (tag === "img") {
+    const alt = normalizeWhitespace(element.getAttribute("alt") || "");
+    if (alt) return alt;
+    const src = element.getAttribute("src") || "";
+    const filename = src.split("/").pop()?.split("?")[0] || "";
+    return filename ? `img: ${filename}` : compactOuterHtml(element);
+  }
+
+  if (tag === "svg") {
+    return ariaLabel || title || "icon";
+  }
+
+  if (tag === "input") {
     const inputType = element.getAttribute("type") || "text";
     const currentValue = element instanceof HTMLInputElement ? element.value : "";
     const valueNote = currentValue ? ` val="${currentValue.substring(0, 40)}"` : "";
     return `${inputType} ${label || "input"}${valueNote}`;
   }
 
-  if (element.tagName.toLowerCase() === "textarea") {
+  if (tag === "textarea") {
     const currentValue = element instanceof HTMLTextAreaElement ? element.value : "";
     const valueNote = currentValue ? ` val="${currentValue.substring(0, 40)}"` : "";
     return `textarea ${label || "textarea"}${valueNote}`;
   }
 
-  if (element.tagName.toLowerCase() === "select") {
+  if (tag === "select") {
     const selectEl = element as HTMLSelectElement;
     const selectedText = selectEl.selectedOptions?.[0]?.textContent?.trim() || "";
     const valueNote = selectedText ? ` val="${selectedText}"` : "";
     return `select ${label || "select"}${valueNote}`;
   }
 
-  return label || "untitled";
+  if (label) return label;
+
+  // Fallback: compact outerHTML snippet so the agent can still identify the element
+  return compactOuterHtml(element);
 };
 
-const getEventHints = (element: Element): string[] => {
-  const record = element as unknown as Record<string, unknown>;
-  const eventHints: string[] = [];
-
-  for (const eventName of EVENT_HINT_NAMES) {
-    const handlerKey = `on${eventName}`;
-    const hasInlineHandler = Boolean(element.getAttribute(handlerKey));
-    const hasPropertyHandler = typeof record[handlerKey] === "function";
-
-    if (!hasInlineHandler && !hasPropertyHandler) {
-      continue;
-    }
-
-    eventHints.push(eventName);
-    if (eventHints.length >= MAX_EVENT_HINTS_PER_ELEMENT) {
-      break;
-    }
-  }
-
-  return eventHints;
+/** Return a trimmed, single-line outerHTML (opening tag + short text), max 90 chars. */
+const compactOuterHtml = (element: Element): string => {
+  const html = element.outerHTML || "";
+  // Take only the opening tag + a little content
+  const closeIdx = html.indexOf(">");
+  if (closeIdx === -1) return html.substring(0, 90);
+  const snippet = html.substring(0, Math.min(closeIdx + 30, 90)).replace(/\s+/g, " ").trim();
+  return snippet || "untitled";
 };
 
-const getAriaInteractionHints = (element: Element): string[] =>
-  ARIA_INTERACTION_ATTRS.filter((attrName) => element.hasAttribute(attrName)).map(
-    (attrName) => attrName.replace("aria-", ""),
-  );
+// ── Semantic element description ────────────────────────────────────
 
-const getDataInteractionHints = (element: Element): string[] =>
-  element
-    .getAttributeNames()
-    .filter(
-      (attrName) =>
-        attrName.startsWith("data-") && DATA_INTERACTION_PATTERN.test(attrName),
-    )
-    .slice(0, 2)
-    .map((attrName) => attrName.replace("data-", ""));
-
-const getComputedStyleSignals = (style: CSSStyleDeclaration): string[] => {
-  const signals: string[] = [];
-
-  if (style.cursor && style.cursor !== "auto") {
-    signals.push(`cursor:${style.cursor}`);
-  }
-  if (style.display) {
-    signals.push(`display:${style.display}`);
-  }
-  if (style.position) {
-    signals.push(`position:${style.position}`);
-  }
-  if (style.zIndex && style.zIndex !== "auto") {
-    signals.push(`z-index:${style.zIndex}`);
-  }
-  if (style.pointerEvents && style.pointerEvents !== "auto") {
-    signals.push(`pointer-events:${style.pointerEvents}`);
-  }
-  if (style.visibility && style.visibility !== "visible") {
-    signals.push(`visibility:${style.visibility}`);
-  }
-  if (style.opacity && style.opacity !== "1") {
-    signals.push(`opacity:${style.opacity}`);
-  }
-
-  return Array.from(new Set(signals));
-};
-
-const buildBlueprintToken = (element: Element): string => {
+const describeElementType = (element: Element): string => {
   const tag = element.tagName.toLowerCase();
-  const idToken = element.id ? `#${compactToken(element.id)}` : "";
-  const classToken = Array.from(element.classList)
-    .map((item) => compactToken(item))
-    .find(Boolean);
+  const role = getPrimaryRole(element);
 
-  return `${tag}${idToken}${classToken ? `.${classToken}` : ""}`;
+  // Role-based override
+  if (role === "button" || tag === "button") return "Button";
+  if (role === "link" || tag === "a") return "Link";
+  if (role === "tab") return "Tab";
+  if (role === "menuitem") return "MenuItem";
+  if (role === "checkbox" || (tag === "input" && element.getAttribute("type") === "checkbox")) return "Checkbox";
+  if (role === "radio" || (tag === "input" && element.getAttribute("type") === "radio")) return "Radio";
+  if (role === "switch") return "Switch";
+  if (role === "combobox" || tag === "select") return "Select";
+  if (role === "textbox" || tag === "textarea") return "TextArea";
+  if (role === "searchbox") return "SearchBox";
+  if (role === "slider" || (tag === "input" && element.getAttribute("type") === "range")) return "Slider";
+  if (role === "spinbutton") return "SpinButton";
+  if (role === "option" || tag === "option") return "Option";
+  if (role === "treeitem") return "TreeItem";
+  if (tag === "input") {
+    const t = element.getAttribute("type") || "text";
+    return `Input[${t}]`;
+  }
+  if (tag === "summary") return "Summary";
+  if (tag === "details") return "Details";
+  if (element.getAttribute("contenteditable") === "true") return "Editable";
+
+  // Generic interactive
+  return role ? `${role[0].toUpperCase()}${role.slice(1)}` : `<${tag}>`;
 };
 
-const buildBranchDigest = (element: Element, depth: number): string => {
-  const token = buildBlueprintToken(element);
-  if (depth <= 0) {
-    return token;
+const getElementState = (element: Element): string[] => {
+  const states: string[] = [];
+
+  const pressed = element.getAttribute("aria-pressed");
+  if (pressed === "true") states.push("Pressed");
+  else if (pressed === "false") states.push("Not pressed");
+
+  const expanded = element.getAttribute("aria-expanded");
+  if (expanded === "true") states.push("Expanded");
+  else if (expanded === "false") states.push("Collapsed");
+
+  const selected = element.getAttribute("aria-selected");
+  if (selected === "true") states.push("Selected");
+
+  if (element instanceof HTMLInputElement) {
+    if (element.type === "checkbox" || element.type === "radio") {
+      states.push(element.checked ? "Checked" : "Unchecked");
+    }
   }
 
-  const children = Array.from(element.children)
-    .filter((child) => !NON_CONTENT_TAGS.has(child.tagName.toLowerCase()))
-    .filter((child) => isVisible(child));
-  if (children.length === 0) {
-    return token;
+  if (element.hasAttribute("disabled") || element.getAttribute("aria-disabled") === "true") {
+    states.push("Disabled");
   }
 
-  const sampled = children
-    .slice(0, 3)
-    .map((child) => buildBranchDigest(child, depth - 1));
-  const overflow =
-    children.length > sampled.length ? `+${children.length - sampled.length}` : "";
-
-  return `${token}>${sampled.join("+")}${overflow}`;
+  return states;
 };
 
-const collectDomBranchDigest = (): string[] => {
-  const root = document.body ?? document.documentElement;
-  const topLevelNodes = Array.from(root.children)
-    .filter((child) => !NON_CONTENT_TAGS.has(child.tagName.toLowerCase()))
-    .filter((child) => isVisible(child))
-    .slice(0, MAX_BRANCH_SAMPLES);
+interface SemanticScanResult {
+  links: string[];
+  interactables: string[];
+  elementMap: Map<number, Element>;
+}
 
-  return topLevelNodes.map((child) =>
-    buildBranchDigest(child, MAX_BRANCH_DEPTH),
-  );
-};
+/**
+ * Scan the DOM and build a semantic element map.
+ *
+ * Every interactive element gets a numeric ID. The LLM uses these IDs
+ * with `interact(id=N)` instead of fragile CSS selectors.
+ */
+const collectSemanticElements = (): SemanticScanResult => {
+  const allElements = Array.from(document.querySelectorAll("*"));
+  const sampledElements = allElements.slice(0, MAX_PAGE_SCAN_ELEMENTS);
 
-const formatSection = (title: string, lines: string[]): string => {
-  if (lines.length === 0) {
-    return `${title}:\n- none`;
+  const links: string[] = [];
+  const linkSet = new Set<string>();
+  const candidates: InteractableCandidate[] = [];
+  const elementMap = new Map<number, Element>();
+  let idCounter = 1;
+
+  for (let order = 0; order < sampledElements.length; order += 1) {
+    const element = sampledElements[order];
+    const tag = element.tagName.toLowerCase();
+
+    if (NON_CONTENT_TAGS.has(tag)) continue;
+    if (SVG_INTERNAL_TAGS.has(tag)) continue;
+    if (!isVisible(element)) continue;
+
+    const role = getPrimaryRole(element);
+    const style = window.getComputedStyle(element);
+    const href = element.getAttribute("href");
+    const isNativeInteractive = NATIVE_INTERACTIVE_TAGS.has(tag) && (tag !== "a" || Boolean(href));
+    const isRoleInteractive = INTERACTIVE_ROLES.has(role);
+    const tabIndex = parseTabIndex(element.getAttribute("tabindex"));
+    const hasTabStop = tabIndex !== null && tabIndex >= 0;
+    const hasPointerCursor = style.cursor === "pointer";
+    const isContentEditable = element.getAttribute("contenteditable") === "true";
+    const isDisabled =
+      element.hasAttribute("disabled") ||
+      element.getAttribute("aria-disabled") === "true";
+
+    // ── Links ───────────────────────────────────────────────────
+    if (
+      tag === "a" &&
+      href &&
+      !href.startsWith("#") &&
+      !href.startsWith("javascript:")
+    ) {
+      const absoluteHref = toAbsoluteUrl(href);
+      const label = getElementLabel(element) || absoluteHref;
+      const id = idCounter++;
+      const line = `- [${id}] ${label} -> ${absoluteHref}`;
+
+      if (!linkSet.has(absoluteHref)) {
+        linkSet.add(absoluteHref);
+        links.push(line);
+        elementMap.set(id, element);
+      }
+    }
+
+    // ── Interactables ───────────────────────────────────────────
+    const hasInteractionSignals =
+      isNativeInteractive ||
+      isRoleInteractive ||
+      isContentEditable ||
+      hasTabStop ||
+      hasPointerCursor;
+
+    if (!hasInteractionSignals || isDisabled) continue;
+
+    // Skip children nested inside an already-interactive parent
+    // (e.g. <span> or <img> inside a <button> or <a>)
+    if (hasInteractiveAncestor(element)) continue;
+
+    const id = idCounter++;
+    elementMap.set(id, element);
+
+    const elType = describeElementType(element);
+    const label = getElementLabel(element);
+    const stateTokens = getElementState(element);
+    const statePart = stateTokens.length > 0 ? ` (${stateTokens.join(", ")})` : "";
+    const line = `- [${id}] ${elType}: "${label}"${statePart}`;
+
+    const score =
+      (isNativeInteractive ? 5 : 0) +
+      (isRoleInteractive ? 4 : 0) +
+      (hasTabStop ? 2 : 0) +
+      (hasPointerCursor ? 2 : 0) +
+      (isContentEditable ? 2 : 0);
+
+    candidates.push({ id, line, score, order, element });
   }
 
-  return `${title}:\n${lines.join("\n")}`;
-};
+  const interactables = candidates
+    .sort((a, b) => b.score - a.score || a.order - b.order)
+    .slice(0, MAX_INTERACTABLES)
+    .map((c) => c.line);
 
-const COMPACT_THRESHOLD = 10_000;
-const TRUNCATION_LIMIT = 50_000;
-
-const buildOuterHtmlDigest = (): string => {
-  const raw = document.body?.outerHTML || document.documentElement.outerHTML;
-
-  const withoutScripts = raw
-    .replace(/<script[\s\S]*?<\/script>/gi, "")
-    .replace(/<style[\s\S]*?<\/style>/gi, "")
-    .replace(/<noscript[\s\S]*?<\/noscript>/gi, "")
-    .replace(/<!--[\s\S]*?-->/g, "")
-    .replace(/\s+/g, " ")
-    .trim();
-
-  // Small pages: keep full content (text between tags preserved)
-  if (withoutScripts.length <= COMPACT_THRESHOLD) {
-    return withoutScripts;
-  }
-
-  // Larger pages: compact to structural skeleton (remove text)
-  const structural = withoutScripts
-    .replace(/>[^<]*</g, "><")
-    .replace(/\s+/g, " ")
-    .trim();
-
-  // Hard truncation at limit
-  if (structural.length > TRUNCATION_LIMIT) {
-    return structural.substring(0, TRUNCATION_LIMIT);
-  }
-
-  return structural;
+  return {
+    links: links.slice(0, MAX_LINKS),
+    interactables,
+    elementMap,
+  };
 };
 
 const collectTextSnippets = (): string[] => {
@@ -625,372 +530,44 @@ const collectTextSnippets = (): string[] => {
 
   const candidates = Array.from(root.querySelectorAll("p, li, h1, h2, h3"));
   for (const node of candidates) {
-    if (!isVisible(node)) {
-      continue;
-    }
+    if (!isVisible(node)) continue;
 
     const text = normalizeWhitespace(node.textContent || "");
-    if (!text || text.length < 20) {
-      continue;
-    }
-
-    if (seen.has(text)) {
-      continue;
-    }
+    if (!text || text.length < 20) continue;
+    if (seen.has(text)) continue;
 
     seen.add(text);
     snippets.push(`- ${text}`);
-    if (snippets.length >= MAX_TEXT_SNIPPETS) {
-      break;
-    }
+    if (snippets.length >= MAX_TEXT_SNIPPETS) break;
   }
 
   return snippets;
 };
 
-const collectLandmarkSnapshot = (): string[] => {
-  const probes: Array<{ label: string; selector: string }> = [
-    { label: "main", selector: "main, [role='main']" },
-    { label: "nav", selector: "nav, [role='navigation']" },
-    { label: "section", selector: "section" },
-    { label: "article", selector: "article" },
-    { label: "form", selector: "form" },
-    { label: "a", selector: "a" },
-    { label: "button", selector: "button" },
-    { label: "input", selector: "input" },
-    { label: "role=button/link", selector: "[role='button'], [role='link']" },
-    { label: "onclick attrs", selector: "[onclick]" },
-    {
-      label: "other event attrs",
-      selector:
-        "[onpointerdown], [onpointerup], [onkeydown], [onkeyup], [onchange], [onsubmit]",
-    },
-    { label: "tabindex", selector: "[tabindex]" },
-    { label: "contenteditable", selector: "[contenteditable='true']" },
-    { label: "inline cursor styles", selector: "[style*='cursor']" },
-  ];
-
-  return probes.map(
-    ({ label, selector }) => `- ${label}: ${document.querySelectorAll(selector).length}`,
-  );
-};
-
-const collectSelectorsFromRuleList = (
-  rules: CSSRuleList,
-  selectors: Set<string>,
-  scanned: { count: number },
-): void => {
-  for (const rule of Array.from(rules)) {
-    if (
-      scanned.count >= MAX_STYLESHEET_RULES ||
-      selectors.size >= MAX_STYLESHEET_SELECTORS
-    ) {
-      return;
-    }
-
-    scanned.count += 1;
-
-    if (rule instanceof CSSStyleRule) {
-      const parts = rule.selectorText
-        .split(",")
-        .map((selector) => normalizeWhitespace(selector))
-        .filter(Boolean);
-
-      for (const selector of parts) {
-        if (!STYLESHEET_SELECTOR_PATTERN.test(selector)) {
-          continue;
-        }
-        selectors.add(selector);
-        if (selectors.size >= MAX_STYLESHEET_SELECTORS) {
-          return;
-        }
-      }
-      continue;
-    }
-
-    if ("cssRules" in rule) {
-      try {
-        const nestedRules = (rule as CSSMediaRule).cssRules;
-        collectSelectorsFromRuleList(nestedRules, selectors, scanned);
-      } catch {
-        // Ignore inaccessible nested rules.
-      }
-    }
-  }
-};
-
-const collectStylesheetSelectors = (): string[] => {
-  const selectors = new Set<string>();
-  const scanned = { count: 0 };
-
-  for (const stylesheet of Array.from(document.styleSheets)) {
-    if (
-      scanned.count >= MAX_STYLESHEET_RULES ||
-      selectors.size >= MAX_STYLESHEET_SELECTORS
-    ) {
-      break;
-    }
-
-    try {
-      if (!stylesheet.cssRules) {
-        continue;
-      }
-      collectSelectorsFromRuleList(stylesheet.cssRules, selectors, scanned);
-    } catch {
-      // Ignore cross-origin stylesheets.
-    }
-  }
-
-  return Array.from(selectors).map((selector) => `- ${selector}`);
-};
-
-const collectPageSignalSnapshot = (): PageSignalSnapshot => {
-  const allElements = Array.from(document.querySelectorAll("*"));
-  const sampledElements = allElements.slice(0, MAX_PAGE_SCAN_ELEMENTS);
-
-  const links: string[] = [];
-  const linkSet = new Set<string>();
-  const interactableCandidates = new Map<string, InteractableCandidate>();
-  const tagCounts = new Map<string, number>();
-  const roleCounts = new Map<string, number>();
-  const eventCounts = new Map<string, number>();
-  const displayCounts = new Map<string, number>();
-  const positionCounts = new Map<string, number>();
-  const styleSignalCounts = new Map<string, number>();
-
-  let visibleElements = 0;
-  let maxDepth = 0;
-  let semanticInteractables = 0;
-  let nonSemanticInteractables = 0;
-  let eventHintElements = 0;
-  let tabStopElements = 0;
-  let pointerCursorElements = 0;
-  let dataHintElements = 0;
-  let ariaHintElements = 0;
-  let contentEditableElements = 0;
-
-  for (let order = 0; order < sampledElements.length; order += 1) {
-    const element = sampledElements[order];
-    const tag = element.tagName.toLowerCase();
-
-    if (NON_CONTENT_TAGS.has(tag)) {
-      continue;
-    }
-
-    if (!isVisible(element)) {
-      continue;
-    }
-
-    visibleElements += 1;
-    bumpCount(tagCounts, tag);
-
-    const role = getPrimaryRole(element);
-    if (role) {
-      bumpCount(roleCounts, role);
-    }
-
-    const depth = getElementDepth(element);
-    if (depth > maxDepth) {
-      maxDepth = depth;
-    }
-
-    const style = window.getComputedStyle(element);
-    if (TRACKED_DISPLAY_VALUES.has(style.display)) {
-      bumpCount(displayCounts, style.display);
-    }
-    if (TRACKED_POSITION_VALUES.has(style.position)) {
-      bumpCount(positionCounts, style.position);
-    }
-
-    const computedStyleSignals = getComputedStyleSignals(style);
-    for (const styleSignal of computedStyleSignals) {
-      bumpCount(styleSignalCounts, styleSignal);
-    }
-
-    const eventHints = getEventHints(element);
-    if (eventHints.length > 0) {
-      eventHintElements += 1;
-      for (const eventName of eventHints) {
-        bumpCount(eventCounts, eventName);
-      }
-    }
-
-    const tabIndex = parseTabIndex(element.getAttribute("tabindex"));
-    const hasTabStop = tabIndex !== null && tabIndex >= 0;
-    if (hasTabStop) {
-      tabStopElements += 1;
-    }
-
-    const hasPointerCursor = style.cursor === "pointer";
-    if (hasPointerCursor) {
-      pointerCursorElements += 1;
-    }
-
-    const dataHints = getDataInteractionHints(element);
-    if (dataHints.length > 0) {
-      dataHintElements += 1;
-    }
-
-    const ariaHints = getAriaInteractionHints(element);
-    if (ariaHints.length > 0) {
-      ariaHintElements += 1;
-    }
-
-    const isContentEditable = element.getAttribute("contenteditable") === "true";
-    if (isContentEditable) {
-      contentEditableElements += 1;
-    }
-
-    const href = element.getAttribute("href");
-    const isNativeInteractive = NATIVE_INTERACTIVE_TAGS.has(tag) && (tag !== "a" || Boolean(href));
-    const isRoleInteractive = INTERACTIVE_ROLES.has(role);
-    const isDisabled =
-      element.hasAttribute("disabled") ||
-      element.getAttribute("aria-disabled") === "true";
-
-    if (
-      tag === "a" &&
-      href &&
-      !href.startsWith("#") &&
-      !href.startsWith("javascript:")
-    ) {
-      const absoluteHref = toAbsoluteUrl(href);
-      const label = getElementLabel(element) || absoluteHref;
-      const line = `- ${label} -> ${absoluteHref}`;
-
-      if (!linkSet.has(line)) {
-        linkSet.add(line);
-        links.push(line);
-        if (links.length >= MAX_LINKS) {
-          // Keep scanning other elements for page blueprint and interactables.
-        }
-      }
-    }
-
-    const hasInteractionSignals =
-      isNativeInteractive ||
-      isRoleInteractive ||
-      isContentEditable ||
-      eventHints.length > 0 ||
-      hasTabStop ||
-      hasPointerCursor ||
-      dataHints.length > 0 ||
-      ariaHints.length > 0;
-
-    if (!hasInteractionSignals || isDisabled) {
-      continue;
-    }
-
-    if (isNativeInteractive) {
-      semanticInteractables += 1;
-    } else {
-      nonSemanticInteractables += 1;
-    }
-
-    const selector = buildSelector(element);
-    const label = getElementLabel(element);
-    const styleSignals = computedStyleSignals;
-    const signalTokens: string[] = [];
-
-    if (eventHints.length > 0) {
-      signalTokens.push(`evt:${eventHints.join("|")}`);
-    }
-    if (isRoleInteractive) {
-      signalTokens.push(`role:${role}`);
-    }
-    if (hasTabStop) {
-      signalTokens.push(`tab:${tabIndex}`);
-    }
-    if (dataHints.length > 0) {
-      signalTokens.push(`data:${dataHints.join("|")}`);
-    }
-    if (ariaHints.length > 0) {
-      signalTokens.push(`aria:${ariaHints.join("|")}`);
-    }
-    if (styleSignals.length > 0) {
-      signalTokens.push(`css:${styleSignals.join("|")}`);
-    } else if (hasPointerCursor) {
-      signalTokens.push("css:cursor:pointer");
-    }
-
-    const signalBlock =
-      signalTokens.length > 0 ? ` [${signalTokens.join("; ")}]` : "";
-    const line = `- ${tag} ${selector}${signalBlock} (${label})`;
-
-    const score =
-      eventHints.length * 5 +
-      (isNativeInteractive ? 5 : 0) +
-      (isRoleInteractive ? 4 : 0) +
-      (hasTabStop ? 2 : 0) +
-      (hasPointerCursor ? 2 : 0) +
-      (dataHints.length > 0 ? 2 : 0) +
-      (ariaHints.length > 0 ? 1 : 0) +
-      (isContentEditable ? 2 : 0);
-
-    const existing = interactableCandidates.get(line);
-    if (!existing || score > existing.score) {
-      interactableCandidates.set(line, { line, score, order });
-    }
-  }
-
-  const interactables = Array.from(interactableCandidates.values())
-    .sort((a, b) => b.score - a.score || a.order - b.order)
-    .slice(0, MAX_INTERACTABLES)
-    .map((candidate) => candidate.line);
-
-  const interactiveRoleCounts = new Map(
-    Array.from(roleCounts.entries()).filter(([role]) =>
-      INTERACTIVE_ROLES.has(role),
-    ),
-  );
-
-  const interactionSignals = [
-    `- coverage: semantic=${semanticInteractables}, non-semantic=${nonSemanticInteractables}, contenteditable=${contentEditableElements}`,
-    `- listener hints: ${formatTopCounts(eventCounts, 8)}`,
-    `- interaction cues: tabindex>=0=${tabStopElements}, pointer-cursor=${pointerCursorElements}, data-hints=${dataHintElements}, aria-hints=${ariaHintElements}`,
-    `- role hints: ${formatTopCounts(interactiveRoleCounts, 8)}`,
-    `- css footprint: ${formatTopCounts(styleSignalCounts, 10)}`,
-    "- listener scope: inline/on* handlers are detected directly; addEventListener handlers are inferred via cues.",
-  ];
-
-  const branchDigest = collectDomBranchDigest();
-  const pageBlueprint = [
-    `- nodes: total=${allElements.length}, scanned=${sampledElements.length}, visible=${visibleElements}, max-depth=${maxDepth}${allElements.length > sampledElements.length ? ", sampling=on" : ""}`,
-    `- tag density: ${formatTopCounts(tagCounts, 10)}`,
-    `- role density: ${formatTopCounts(roleCounts, 8)}`,
-    `- layout density: display(${formatTopCounts(displayCounts, 6)}), position(${formatTopCounts(positionCounts, 4)})`,
-    `- branch digest: ${branchDigest.length > 0 ? branchDigest.join(" || ") : "none"}`,
-  ];
-
-  return {
-    links: links.slice(0, MAX_LINKS),
-    interactables,
-    interactionSignals,
-    styleSelectors: collectStylesheetSelectors(),
-    pageBlueprint,
-  };
+const formatSection = (title: string, lines: string[]): string => {
+  if (lines.length === 0) return `${title}:\n- none`;
+  return `${title}:\n${lines.join("\n")}`;
 };
 
 export const buildPageContextSummary = (
-  input: PageContextSummaryInput,
+  url: string,
+  title: string,
+  lang: string,
+  headings: string[],
+  links: string[],
+  interactables: string[],
+  textSnippets: string[],
 ): string => {
   const sections = [
-    formatSection("Meta", [
-      `- URL: ${input.url || "unknown"}`,
-      `- Title: ${input.title || "unknown"}`,
-      `- Lang: ${input.lang || "unknown"}`,
+    formatSection("Page", [
+      `- URL: ${url || "unknown"}`,
+      `- Title: ${title || "unknown"}`,
+      `- Lang: ${lang || "unknown"}`,
     ]),
-    formatSection("Headings", input.headings),
-    formatSection("Landmark Snapshot", input.landmarks),
-    formatSection("Interaction Signals", input.interactionSignals),
-    formatSection("Stylesheet Selector Snapshot", input.styleSelectors),
-    formatSection("Compressed Page Blueprint", input.pageBlueprint),
-    formatSection("Top Links", input.links),
-    formatSection("Top Interactables", input.interactables),
-    formatSection("Main Content Snippets", input.textSnippets),
-    formatSection("OuterHTML Skeleton", [
-      `- ${input.outerHtmlDigest || "unavailable"}`,
-    ]),
+    formatSection("Headings", headings),
+    formatSection("Content Snippets", textSnippets),
+    formatSection("Links", links),
+    formatSection("Interactive Elements", interactables),
   ];
 
   return sections.join("\n\n");
@@ -1024,11 +601,17 @@ export const getPageContext = (forceRefresh: boolean = false): PageContext => {
       links: [],
       interactables: [],
       summary: "",
+      elementMap: new Map(),
     };
   }
 
   hydrateCacheFromStorage();
   const url = canonicalUrl(window.location.href);
+
+  // Always rebuild the live element map (it holds DOM references)
+  const scan = collectSemanticElements();
+  liveElementMap = scan.elementMap;
+
   if (!forceRefresh) {
     const cached = pageContextCache.get(url);
     if (cached) {
@@ -1037,13 +620,13 @@ export const getPageContext = (forceRefresh: boolean = false): PageContext => {
         links: cached.links,
         interactables: cached.interactables,
         summary: buildSummaryWithHistory(cached),
+        elementMap: liveElementMap,
       };
     }
   }
 
   console.info(`[Autic] context cache miss url=${url}`);
 
-  const snapshot = collectPageSignalSnapshot();
   const headings = Array.from(document.querySelectorAll("h1, h2, h3"))
     .filter((element) => isVisible(element))
     .map((element) =>
@@ -1052,26 +635,21 @@ export const getPageContext = (forceRefresh: boolean = false): PageContext => {
     .filter((line) => line !== "- ")
     .slice(0, MAX_HEADINGS);
 
-  const summary = buildPageContextSummary({
+  const summary = buildPageContextSummary(
     url,
-    title: document.title,
-    lang: document.documentElement.lang,
+    document.title,
+    document.documentElement.lang,
     headings,
-    landmarks: collectLandmarkSnapshot(),
-    links: snapshot.links,
-    interactables: snapshot.interactables,
-    interactionSignals: snapshot.interactionSignals,
-    styleSelectors: snapshot.styleSelectors,
-    pageBlueprint: snapshot.pageBlueprint,
-    textSnippets: collectTextSnippets(),
-    outerHtmlDigest: buildOuterHtmlDigest(),
-  });
+    scan.links,
+    scan.interactables,
+    collectTextSnippets(),
+  );
 
   const entry: CachedPageContextEntry = {
     url,
     summary,
-    links: snapshot.links,
-    interactables: snapshot.interactables,
+    links: scan.links,
+    interactables: scan.interactables,
     capturedAt: Date.now(),
     version: PAGE_CONTEXT_CACHE_VERSION,
   };
@@ -1087,5 +665,6 @@ export const getPageContext = (forceRefresh: boolean = false): PageContext => {
     links: entry.links,
     interactables: entry.interactables,
     summary: buildSummaryWithHistory(entry),
+    elementMap: liveElementMap,
   };
 };
